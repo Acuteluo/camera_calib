@@ -740,6 +740,7 @@ def main():
             self._t0 = time.time()
             self.max_samples = MAX_SAMPLES
             self.sample_bytes = 0
+            self.driver_log = None
             self._cap_warned = False
             self._pub_t = 0.0
             self._pub_warn = None
@@ -1093,9 +1094,13 @@ def main():
             except Exception as e:
                 self.log("准备驱动环境失败: %s" % e)
                 return
-            self.session = self.session or new_session("%s_%dx%d" % (self.driver, size[0], size[1]))
-            logf = os.path.join(self.session, "驱动日志.log")
+            # 驱动日志单独放 <结果根>/驱动日志/ 下：**不建标定会话**。
+            # 否则只是点一下【启动驱动】就会冒出一个空的"标定结果"目录，还会顶掉 latest。
+            logdir = os.path.join(RESULTS_ROOT, "驱动日志")
+            os.makedirs(logdir, exist_ok=True)
+            logf = os.path.join(logdir, time.strftime("%Y%m%d_%H%M%S_driver.log"))
             self._logf = open(logf, "w")
+            self.driver_log = logf
             self.log("启动 %s ...（日志 %s）" % (d["label"], logf))
             self.driver_proc = subprocess.Popen(
                 ["ros2", "run", d["pkg"], d["exe"]], env=env, stdout=subprocess.PIPE,
@@ -1334,6 +1339,14 @@ def main():
             self.session = save_outputs(self.driver, self.res, self.samples, sz, square,
                                         session=self.session,
                                         ace_template=self.ace_template)
+            # 本次运行的驱动日志一并归档（原始日志在 <结果根>/驱动日志/ 下）
+            logf = getattr(self, "driver_log", None)
+            if logf and os.path.isfile(logf):
+                try:
+                    import shutil as _sh
+                    _sh.copyfile(logf, os.path.join(self.session, "驱动日志.log"))
+                except OSError:
+                    pass
             self.saved = True
             self.log("已输出到 %s" % self.session)
             self.log("  %s" % ", ".join(sorted(os.listdir(self.session))))
