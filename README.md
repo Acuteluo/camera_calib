@@ -13,13 +13,18 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 
 ## 环境要求
 
+> **先分清两层，别混起来**：
+> **Ubuntu 22.04** 是**操作系统**（代号 jammy）；**ROS 2 Humble** 是**跑在它上面的 ROS 发行版**。
+> ROS 2 每个发行版绑定一个 Ubuntu LTS：**Humble ↔ 22.04**、**Jazzy ↔ 24.04**。
+> 本工具用到 ROS 的功能需要两者同时具备；**只走纯 OpenCV 路线则不需要 ROS**（见下表最后一行）。
+
 ### 必需
 
-| 项目 | 要求 | 说明 |
+| 层级 | 要求 | 说明 |
 |---|---|---|
-| 系统 | **Ubuntu 22.04（jammy）** | 其它发行版/版本未验证 |
-| Python | 3.10（系统自带） | |
-| ROS 2 | **Humble**（`ros-humble-desktop`） | 提供 `rclpy` / `sensor_msgs` / `image_transport` / `cv_bridge` |
+| **① 操作系统** | **Ubuntu 22.04 LTS**（代号 jammy） | 只走纯 OpenCV 路线时其它 Linux 也可（未验证） |
+| **② ROS 2 发行版** | **Humble**（软件包前缀 `ros-humble-*`） | 只有用到 ROS 的功能才需要；提供 `rclpy` / `sensor_msgs` / `image_transport` / `cv_bridge` |
+| Python | 3.10 | Ubuntu 22.04 自带，也是 Humble 官方支持的版本 |
 | 系统包 | `python3-numpy` `python3-opencv` `python3-yaml`<br>`python3-pil` `python3-pil.imagetk` `python3-tk` | ROS desktop 已带 numpy / opencv / yaml / tkinter；**PIL 要自己装**，且 Ubuntu 上 `python3-pil` 与 `python3-pil.imagetk` 是两个包（GUI 的 `ImageTk` 在后者里） |
 | 中文字体 | `fonts-noto-cjk` | 缺它界面中文会显示成方框；程序仍能运行 |
 
@@ -29,6 +34,17 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 ./install_deps.sh            # 检查并安装缺失的依赖
 ./install_deps.sh --check    # 只检查、只报告，不需要 sudo
 ```
+
+### 组合兼容性
+
+| 操作系统 + ROS 2 | 状态 |
+|---|---|
+| Ubuntu 22.04 + Humble | ✅ **实测通过**（本仓库的开发/验证环境） |
+| Ubuntu 24.04 + Jazzy | ⚠️ 理论可用（脚本会自动探测 `ROS_DISTRO`、代码只用 OpenCV 4.5+ 就有的 API），但**未实测** |
+| 任意 Linux，不用 ROS | ✅ 纯 OpenCV 路线可用（`calibrate_mono.py` / `capture_chessboard.py` / `selftest_synthetic.py`） |
+
+> 换 ROS 发行版不用改代码：脚本按 `ROS_DISTRO` 环境变量找环境，找不到就退到 `humble`，
+> 再退到 `/opt/ros/` 下任意一个。ACE 相关功能与 `ros2_calibrate.sh` 依赖的包名也会跟着变。
 
 ### 可选
 

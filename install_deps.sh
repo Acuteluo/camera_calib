@@ -47,9 +47,24 @@ OPTIONAL=()
 
 echo "=============================================================="
 echo " 相机标定工具 —— 依赖检查"
+echo "   （操作系统 与 ROS 2 发行版 是两层：Humble 绑定 Ubuntu 22.04）"
 echo "=============================================================="
 echo
-echo "[1/4] ROS 2"
+echo "[0/4] 操作系统"
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  echo "  ${PRETTY_NAME:-未知}"
+  if [[ "${VERSION_ID:-}" == "22.04" ]]; then
+    ok "Ubuntu 22.04 —— 本工具验证过的版本"
+  else
+    warn "非 Ubuntu 22.04（VERSION_ID=${VERSION_ID:-?}）——未验证；纯 OpenCV 路线一般仍可用"
+  fi
+else
+  warn "读不到 /etc/os-release，无法判断发行版"
+fi
+echo
+echo "[1/4] ROS 2 发行版"
 if [[ -n "$ROS_DISTRO_DETECTED" && -f "/opt/ros/$ROS_DISTRO_DETECTED/setup.bash" ]]; then
   ok "找到 ROS 2 $ROS_DISTRO_DETECTED （/opt/ros/$ROS_DISTRO_DETECTED）"
   OPTIONAL=("ros-$ROS_DISTRO_DETECTED-camera-calibration" "ros-$ROS_DISTRO_DETECTED-image-pipeline")
