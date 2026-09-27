@@ -1,0 +1,4 @@
+# 大恒 Galaxy USB3 相机
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2ba2", MODE:="0666", TAG+="uaccess", TAG+="udev-acl"
+# 海康机器人 USB3 相机：原来锁成 0660 + plugdev（要求重新登录才生效），放宽为 0666
+SUBSYSTEM=="usb", ATTR{idVendor}=="2bdf", MODE:="0666", TAG+="uaccess"

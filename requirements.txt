@@ -1,0 +1,16 @@
+# 这是"用 pip 装"的替代方案。
+#
+# Ubuntu 22.04 + ROS 2 Humble 用户**不需要**这个文件：
+#     ./install_deps.sh        # 用 apt 装齐所有依赖（推荐，与 ROS 自带的 OpenCV 版本一致）
+#
+# 什么时候用本文件：
+#   * 不用 apt 包管理（例如 Conda / venv 环境）；
+#   * 系统里没有 ROS，只想跑纯 OpenCV 路线（calibrate_mono.py / capture_chessboard.py）；
+#   * 想用更新版 OpenCV（注意：apt 的 4.5.4 已足够，见 README「版本兼容性」）。
+#
+#     pip install -r requirements.txt
+
+numpy>=1.21
+opencv-python>=4.5
+PyYAML>=5.4
+Pillow>=8.0

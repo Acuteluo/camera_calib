@@ -1,0 +1,4 @@
+# 迈德威视 (MindVision) USB 相机 —— 原文件被截断损坏（行尾是 A" / R"），此处重写
+# VID f622 = MindVision，080b = 其 OEM
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="f622", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTR{idVendor}=="080b", MODE="0666", TAG+="uaccess"

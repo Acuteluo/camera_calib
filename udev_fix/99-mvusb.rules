@@ -1,0 +1,3 @@
+# 迈德威视：原来引用了不存在的用户组 mvusb_dev，改为直接用 MODE=0666
+SUBSYSTEM=="usb", ATTR{idVendor}=="f622", MODE="0666", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTR{idVendor}=="080b", MODE="0666", TAG+="uaccess"
