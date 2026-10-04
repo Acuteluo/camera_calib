@@ -23,7 +23,7 @@
     python3 ace_export.py --dry-run                 # 先看计划
     python3 ace_export.py                           # 写回各自结果目录（跳过已存在）
     python3 ace_export.py --out /tmp/ace_json       # 统一输出到别处
-    python3 ace_export.py --template ~/ACE27/config/cameras/hero.json
+    python3 ace_export.py --template ./reference_json/hero.json
     python3 ace_export.py --uv                       # 顺带从 frames/ 统计角点覆盖范围
 """
 
@@ -154,7 +154,7 @@ def main():
         description="把已有标定结果批量转换成 ACE27 相机配置 JSON（只新增，不删除）")
     ap.add_argument("--results", default=DEFAULT_RESULTS, help="标定结果根目录")
     ap.add_argument("--template", default=ace_json.DEFAULT_TEMPLATE,
-                    help="ACE 相机配置模板（JSONC），默认 ACE27/config/cameras/uav.json")
+                    help="ACE 相机配置模板（JSONC），默认项目内 reference_json/uav.json")
     ap.add_argument("--out", default=None,
                     help="统一输出目录；不给则写回各自结果目录（文件名同模板）")
     ap.add_argument("--name", default=None, help="输出文件名；默认取模板文件名")

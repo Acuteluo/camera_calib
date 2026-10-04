@@ -30,14 +30,14 @@ import numpy as np
 def default_template():
     """默认 ACE 相机配置模板。
 
-    优先环境变量 ACE_TEMPLATE；否则找常见的 ACE27 相机配置（本工具默认配套的机器人项目）。
+    优先环境变量 ACE_TEMPLATE；否则使用项目内 reference_json/uav.json。
     模板只是"格式样板"：除了内参字段，其余内容（安装外参、采集参数、注释、缩进）都会
     原样复制，所以换成任意一份同结构的相机配置都可以。
     """
     env = os.environ.get("ACE_TEMPLATE")
     if env:
         return os.path.abspath(os.path.expanduser(env))
-    return os.path.join(os.path.expanduser("~"), "ACE27", "config", "cameras", "uav.json")
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "reference_json", "uav.json")
 
 
 DEFAULT_TEMPLATE = default_template()
@@ -384,6 +384,9 @@ def _leaf_diffs(a, b, path=()):
 def self_test(template_path=None):
     """自检：渲染后除内参字段外，模板参数必须逐项不变，且输出是合法 JSONC。"""
     tpl_path = template_path or DEFAULT_TEMPLATE
+    if not os.path.isfile(tpl_path):
+        tpl_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tests", "fixtures", "ace_camera.json")
     with open(tpl_path, encoding="utf-8") as f:
         tpl = f.read()
     tpl_obj = json.loads(strip_comments(tpl))

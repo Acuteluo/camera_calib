@@ -1,0 +1,105 @@
+{
+    // uav 相机标定与采集配置：robot_params 的 camera_index 按 cameras.camera_N 选择节点；
+    // uav 相机指的是现在就在无人机上的，用于测试的相机
+    // camera_matrix/distortion_coefficients 供 PnP 解算，odom2camera 供 pose BA 外参。
+    // 内参来源：2026-09-23 01:19 海康 MV-CS016-10UC 单目标定（11x8 内角点 / 25.0 mm 方格 /
+    // 1440x1080 / 103 视图 / 角点覆盖 u[39,1339] v[31,993]）。工具报告 RMS 0.2152 px 是经典
+    // 角点检测器口径；同一内参在 SB 精确角点上独立重算 RMS 0.0793 px。结果目录
+    // camera_calib/标定结果/20260923_011956_hik_11x8。内参、畸变、投影矩阵与安装外参同时替换，
+    // 采集参数保持原值。
+    "schema_version": 1, // 文档首键
+    "cameras": {
+        "camera_0": {
+            // 相机外参："a b c" 空格分隔三分量；use_pose_ba 时必填，缺失或非法启动失败
+            "odom2camera": {
+                "xyz": "-0.10201 0.0  -0.0715", // 相机光心在 body 系位置，米，{x,y,z}；台架实测 (-102.01, 0.0, -71.5) mm
+                "rpy": "0.0  0.0  0.0" // body 系 ZYX 安装角，degree，{roll,pitch,yaw}
+            },
+            // 采集参数（hik 相机后端消费）；0 值多为"不覆盖相机当前值"的占位
+            "camera_config": {
+                "max_read_fps": 0, // 采集帧率上限，Hz；0 不限制
+                "width": 1440, // 【死键】透传字段：运行期无消费方（采集宽高取实际帧）
+                "height": 1080, // 【死键】透传字段：运行期无消费方
+                "bayer_cvt_quality": 2, // Bayer 转换质量；0 不覆盖
+                "pixel_format": "0x01080009", // 像素格式串（0x 或十进制）；空串保持相机默认
+                "adc_bit_depth": 12, // ADC 位深，仅支持 8/10/12；0 不覆盖
+                "device_id": "", // 相机序列号精确匹配；空串改按 vid_pid 枚举，多台匹配拒绝启动
+                "vid_pid": "2bdf:0001", // USB VID:PID 枚举筛选串（原 modes.json common.vid_pid）；本机 hik 设备筛选值，空串不筛选
+                "flip_image": false, // true 时水平+垂直双向翻转图像
+                // 本相机自己的模式曝光/增益三组（2026-09-25 由 modes.json 下沉，形态二）：
+                // 开流初值取 profile.setting_workmode 对应那组，运行期由 mode_sync 按模式边沿切换；
+                // exposure_ms 键名为历史遗留，实际口径是微秒，直读不换算。
+                "auto_aim": { "exposure_ms": 3400, "gain": 15 }, // 自瞄模式
+                "outpost": { "exposure_ms": 6000, "gain": 15 }, // 前哨站模式
+                "buff": { "exposure_ms": 2000, "gain": 15 } // 打符模式
+            },
+            "image_width": 1440, // 【死键】透传字段：运行期无消费方
+            "image_height": 1080, // 【死键】透传字段：运行期无消费方
+            "camera_name": "narrow_stereo", // 【死键】透传字段：运行期无消费方
+            // 3x3 相机内参，行主序；fx/fy 焦距像素、cx/cy 主点像素；PnP 解算消费，fx/fy 必须为正
+            "camera_matrix": {
+                "rows": 3, // 【死键】透传字段：运行期无消费方
+                "cols": 3, // 【死键】透传字段：运行期无消费方
+                "data": [
+                    1758.45314,
+                    0.0,
+                    734.19835,
+                    0.0,
+                    1758.10813,
+                    544.41913,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            },
+            "distortion_model": "plumb_bob", // 【死键】透传字段：运行期无消费方
+            // 畸变系数；长度须为 OpenCV 支持的 4/5/8/12/14，通常为 (k1,k2,p1,p2,k3)，其它长度使 solvePnP 运行期抛异常
+            "distortion_coefficients": {
+                "rows": 1, // 【死键】透传字段：运行期无消费方
+                "cols": 5, // 【死键】透传字段：运行期无消费方
+                "data": [
+                    -0.060136,
+                    0.113321,
+                    -0.000556,
+                    0.000125,
+                    0.0
+                ]
+            },
+            // 【死键】透传字段：运行期无消费方（含 rows/cols/data）
+            "rectification_matrix": {
+                "rows": 3,
+                "cols": 3,
+                "data": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0
+                ]
+            },
+            // 【死键】透传字段：运行期无消费方（含 rows/cols/data）
+            "projection_matrix": {
+                "rows": 3,
+                "cols": 4,
+                "data": [
+                    1746.23947,
+                    0.0,
+                    734.42027,
+                    0.0,
+                    0.0,
+                    1749.86489,
+                    544.17454,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                ]
+            }
+        }
+    }
+}

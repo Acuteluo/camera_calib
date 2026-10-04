@@ -1,156 +1,78 @@
 #!/usr/bin/env bash
-# =============================================================================
-# install_deps.sh —— 安装本工具的系统依赖（Ubuntu 22.04 + ROS 2）
-#
-#   ./install_deps.sh            # 检查并安装缺失的依赖
-#   ./install_deps.sh --check    # 只检查、只报告，不安装（不需要 sudo）
-#
-# 说明：
-#   * 只安装系统包，不改动你的代码、配置和标定结果；
-#   * ROS 2 本身（rclpy / sensor_msgs / image_transport / cv_bridge）需要你事先装好，
-#     本脚本只做检查并给出官方安装指引，不会替你装 ROS。
-# =============================================================================
+# Ubuntu apt 部署；ROS 本体由用户安装，纯 OpenCV/离线自检不需要 ROS。
 set -o pipefail
-
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-install}"
-if [[ "$MODE" != "--check" && "$MODE" != "install" ]]; then
-  echo "用法: $0 [--check]" >&2
-  exit 2
+[[ $# -le 1 && ( "$MODE" == install || "$MODE" == --check ) ]] || {
+  echo "用法: $0 [--check]" >&2; exit 2;
+}
+# shellcheck source=runtime.sh
+source "$HERE/runtime.sh"
+command -v dpkg-query >/dev/null && command -v apt-get >/dev/null || {
+  echo "错误：本脚本需要 Ubuntu/Debian apt；其他环境请使用 requirements.txt。" >&2; exit 1;
+}
+SUDO=()
+[[ $(id -u) -eq 0 ]] || SUDO=(sudo)
+if [[ ! -x "$CALIB_PYTHON" ]]; then
+  [[ "$MODE" != --check ]] || { echo "缺少系统 Python：$CALIB_PYTHON" >&2; exit 1; }
+  "${SUDO[@]}" apt-get update && "${SUDO[@]}" apt-get install -y python3 || exit 1
 fi
-
-C_OK=$'\033[32m'; C_ERR=$'\033[31m'; C_WARN=$'\033[33m'; C_DIM=$'\033[2m'; C_END=$'\033[0m'
-ok()   { printf '%s✔%s %s\n' "$C_OK" "$C_END" "$*"; }
-bad()  { printf '%s✘%s %s\n' "$C_ERR" "$C_END" "$*"; }
-warn() { printf '%s!%s %s\n' "$C_WARN" "$C_END" "$*"; }
-dim()  { printf '%s%s%s\n' "$C_DIM" "$*" "$C_END"; }
-
-have() { dpkg-query -W -f='${Version}' "$1" >/dev/null 2>&1; }
-
-# ROS 发行版：优先当前环境，否则 humble，否则 /opt/ros 下任意一个
-ROS_DISTRO_DETECTED="${ROS_DISTRO:-}"
-if [[ -z "$ROS_DISTRO_DETECTED" || ! -f "/opt/ros/$ROS_DISTRO_DETECTED/setup.bash" ]]; then
-  if [[ -f /opt/ros/humble/setup.bash ]]; then
-    ROS_DISTRO_DETECTED=humble
-  else
-    for _d in $(ls -1d /opt/ros/*/setup.bash 2>/dev/null | sort -r); do
-      ROS_DISTRO_DETECTED="$(basename "$(dirname "$_d")")"; break
-    done
-  fi
-fi
-
-# 必需：Python 运行库（GUI / 标定 / YAML）
-REQUIRED=(python3-numpy python3-opencv python3-yaml python3-pil python3-pil.imagetk python3-tk)
-# 推荐：中文字体（没有也能跑，界面中文会退化成方框/英文字体）
+calib_base_env || exit 1
+# dpkg-query -W 对已删除但残留配置的包也可能返回 0，必须核对安装状态。
+have() { [[ "$(dpkg-query -W -f='${Status}' "$1" 2>/dev/null)" == 'install ok installed' ]]; }
+REQUIRED=(python3 python3-numpy python3-opencv python3-yaml python3-pil python3-pil.imagetk python3-tk)
 RECOMMENDED=(fonts-noto-cjk)
-# 可选：只有 ros2_calibrate.sh（ROS 官方 cameracalibrator 编排）路线需要
-OPTIONAL=()
-
-echo "=============================================================="
-echo " 相机标定工具 —— 依赖检查"
-echo "   （操作系统 与 ROS 2 发行版 是两层：Humble 绑定 Ubuntu 22.04）"
-echo "=============================================================="
-echo
-echo "[0/4] 操作系统"
-if [[ -r /etc/os-release ]]; then
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  echo "  ${PRETTY_NAME:-未知}"
-  if [[ "${VERSION_ID:-}" == "22.04" ]]; then
-    ok "Ubuntu 22.04 —— 本工具验证过的版本"
-  else
-    warn "非 Ubuntu 22.04（VERSION_ID=${VERSION_ID:-?}）——未验证；纯 OpenCV 路线一般仍可用"
-  fi
+ROS_ARGS=()
+if calib_ros_env; then
+  echo "ROS 2: $ROS_DISTRO"
+  REQUIRED+=("ros-$ROS_DISTRO-rclpy" "ros-$ROS_DISTRO-sensor-msgs")
+  ROS_ARGS=(--ros)
 else
-  warn "读不到 /etc/os-release，无法判断发行版"
+  echo "未找到 ROS 2：可运行离线标定/自检；启动图形界面的 ROS 订阅功能需另装 ROS。"
 fi
-echo
-echo "[1/4] ROS 2 发行版"
-if [[ -n "$ROS_DISTRO_DETECTED" && -f "/opt/ros/$ROS_DISTRO_DETECTED/setup.bash" ]]; then
-  ok "找到 ROS 2 $ROS_DISTRO_DETECTED （/opt/ros/$ROS_DISTRO_DETECTED）"
-  OPTIONAL=("ros-$ROS_DISTRO_DETECTED-camera-calibration" "ros-$ROS_DISTRO_DETECTED-image-pipeline")
-else
-  bad "没找到任何 ROS 2 环境（/opt/ros/*/setup.bash）"
-  dim "    纯 OpenCV 路线（calibrate_mono.py / capture_chessboard.py / selftest_synthetic.py）不需要 ROS，"
-  dim "    但图形界面和图像话题订阅需要。安装指引："
-  dim "    https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debians.html"
-  echo "    sudo apt install ros-humble-desktop"
-fi
-echo
-
-echo "[2/4] 必需的系统包"
 MISSING=()
-for p in "${REQUIRED[@]}"; do
-  if have "$p"; then
-    ok "$p"
+for package in "${REQUIRED[@]}"; do
+  if have "$package"; then
+    echo "✔ $package 已安装"
   else
-    bad "$p"
-    MISSING+=("$p")
+    echo "✘ $package 未安装"
+    MISSING+=("$package")
   fi
 done
-echo
-
-echo "[3/4] 推荐的系统包"
-MISSING_OPT=()
-for p in "${RECOMMENDED[@]}"; do
-  if have "$p"; then
-    ok "$p"
-  else
-    warn "$p（缺它界面中文可能显示成方框，程序仍可运行）"
-    MISSING_OPT+=("$p")
-  fi
-done
-echo
-
-echo "[4/4] 可选：ROS 官方标定编排（ros2_calibrate.sh 用）"
-for p in "${OPTIONAL[@]}"; do
-  if have "$p"; then
-    ok "$p"
-  else
-    warn "$p（只有 ./ros2_calibrate.sh run 这条路线需要，纯 GUI / 纯 OpenCV 不需要）"
-    MISSING_OPT+=("$p")
-  fi
-done
-echo
-
-# --------------------------------------------------------------------------- #
-if [[ "$MODE" == "--check" ]]; then
-  echo "=============================================================="
-  if [[ ${#MISSING[@]} -eq 0 ]]; then
-    ok "必需依赖齐全，可以直接用。"
-  else
-    bad "缺少必需依赖：${MISSING[*]}"
-    echo "    装它们跑：  ./install_deps.sh"
-  fi
-  [[ ${#MISSING_OPT[@]} -gt 0 ]] && dim "    可选未装：${MISSING_OPT[*]}"
-  echo "=============================================================="
-  [[ ${#MISSING[@]} -eq 0 ]]
-  exit $?
-fi
-
-ALL=("${MISSING[@]}" "${MISSING_OPT[@]}")
-if [[ ${#ALL[@]} -eq 0 ]]; then
-  echo "=============================================================="
-  ok "全部依赖已就绪，不需要安装。"
-  echo "=============================================================="
+RUNTIME_OK=0
+"$CALIB_PYTHON" -s "$HERE/check_runtime.py" "${ROS_ARGS[@]}" && RUNTIME_OK=1
+if [[ "$MODE" == --check ]]; then
+  [[ ${#MISSING[@]} -eq 0 && $RUNTIME_OK -eq 1 ]] || {
+    echo "依赖未就绪，请运行 ./install_deps.sh。" >&2; exit 1;
+  }
+  echo "必需依赖包及实际 Python 导入全部通过。"
   exit 0
 fi
-
-echo "准备安装：${ALL[*]}"
-echo "（需要 sudo 权限；只装系统包，不动你的代码与标定结果）"
-echo
-if ! sudo apt update; then
-  bad "apt update 失败，请检查网络或软件源"
-  exit 1
+OPTIONAL_MISSING=()
+for package in "${RECOMMENDED[@]}"; do
+  have "$package" || OPTIONAL_MISSING+=("$package")
+done
+if [[ ${#MISSING[@]} -gt 0 || $RUNTIME_OK -eq 0 || ${#OPTIONAL_MISSING[@]} -gt 0 ]]; then
+  "${SUDO[@]}" apt-get update || { echo "apt 更新失败，请检查软件源/网络。" >&2; exit 1; }
+  if [[ ${#MISSING[@]} -gt 0 || $RUNTIME_OK -eq 0 ]]; then
+    "${SUDO[@]}" apt-get install -y "${REQUIRED[@]}" || exit 1
+  fi
+  if [[ ${#OPTIONAL_MISSING[@]} -gt 0 ]]; then
+    "${SUDO[@]}" apt-get install -y "${OPTIONAL_MISSING[@]}" || echo "提示：中文字体未安装。" >&2
+  fi
 fi
-if sudo apt install -y "${ALL[@]}"; then
-  echo
-  echo "=============================================================="
-  ok "安装完成。下一步："
-  dim "    自检（不需要相机）：  python3 selftest_synthetic.py"
-  dim "                         python3 calib_gui.py --self-test"
-  dim "    图形界面：            ./run_gui.sh"
-  echo "=============================================================="
-else
-  bad "安装失败，请把上面的报错发出来"
-  exit 1
+# 安装成功必须以运行环境可用为准；损坏的系统包尝试修复一次。
+if ! "$CALIB_PYTHON" -s "$HERE/check_runtime.py" "${ROS_ARGS[@]}"; then
+  echo "安装后导入仍失败，尝试重新安装系统依赖。"
+  "${SUDO[@]}" apt-get install --reinstall -y "${REQUIRED[@]}" || exit 1
+  "$CALIB_PYTHON" -s "$HERE/check_runtime.py" "${ROS_ARGS[@]}" || {
+    echo "依赖仍不可用：请检查上方模块路径及错误，尤其 /usr/local 下的 pip 包冲突。" >&2; exit 1;
+  }
 fi
+for package in "${REQUIRED[@]}"; do
+  have "$package" || { echo "安装状态异常：$package" >&2; exit 1; }
+done
+echo "安装和实际导入验证完成。"
+echo "无相机自检：./run_gui.sh --self-test"
+echo "桌面启动：  ./run_gui.sh"
+echo "ROS 官方标定（可选）：sudo apt install ros-\${ROS_DISTRO}-camera-calibration ros-\${ROS_DISTRO}-image-pipeline"

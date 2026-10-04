@@ -47,8 +47,8 @@ def matching_points(pattern_size, square, pattern):
         # 非对称圆点阵：每个方格中心一个点，奇偶行错开半个方格
         for i in range(rows):
             for j in range(cols):
-                objp[i * cols + j, 0] = (2 * j + (i % 2)) * square
-                objp[i * cols + j, 1] = i * square
+                objp[i * cols + j, 0] = 2 * j + (i % 2)
+                objp[i * cols + j, 1] = i
     else:
         xv, yv = np.meshgrid(np.arange(cols), np.arange(rows))
         objp[:, 0] = xv.ravel()
@@ -62,9 +62,13 @@ def matching_points(pattern_size, square, pattern):
 def make_charuco_board(pattern_size, square, marker_size, dict_name):
     dict_id = getattr(cv2.aruco, "DICT_" + dict_name.upper(), cv2.aruco.DICT_5X5_250)
     dictionary = cv2.aruco.getPredefinedDictionary(dict_id)
-    board = cv2.aruco.CharucoBoard(
-        (pattern_size[0] + 1, pattern_size[1] + 1), float(square), float(marker_size), dictionary
-    )
+    if hasattr(cv2.aruco, "CharucoBoard_create"):  # Ubuntu 22.04 / OpenCV 4.5
+        board = cv2.aruco.CharucoBoard_create(pattern_size[0] + 1, pattern_size[1] + 1,
+                                             float(square), float(marker_size), dictionary)
+    else:
+        board = cv2.aruco.CharucoBoard(
+            (pattern_size[0] + 1, pattern_size[1] + 1), float(square), float(marker_size), dictionary)
+
     return board, dictionary
 
 
@@ -82,7 +86,8 @@ def detect_corners(gray, pattern_size, pattern, use_sb=True, charuco=None):
             _, ch_corners, ch_ids = cv2.aruco.interpolateCornersCharuco(corners, ids, gray, board)
         if ch_ids is None or len(ch_ids) < 8:
             return None, None
-        all_obj = board.getChessboardCorners()
+        all_obj = (board.getChessboardCorners() if hasattr(board, "getChessboardCorners")
+                   else board.chessboardCorners)
         ids = ch_ids.ravel().astype(int)
         return (
             ch_corners.reshape(-1, 1, 2).astype(np.float32),

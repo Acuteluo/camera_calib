@@ -1,0 +1,17 @@
+{
+  // 内参来源：自检模板，仅供测试，不能作为真实相机配置。
+  "cameras": {
+    "camera_0": {
+      "camera_config": { "exposure": 5000, "gain": 2 },
+      "odom2camera": { "translation": [0.1, 0.2, 0.3] },
+      "image_width": 1440,
+      "image_height": 1080,
+      "camera_name": "synthetic",
+      "camera_matrix": { "rows": 3, "cols": 3, "data": [1750, 0, 733, 0, 1749, 549, 0, 0, 1] },
+      "distortion_model": "plumb_bob",
+      "distortion_coefficients": { "rows": 1, "cols": 5, "data": [-0.056, 0.044, 0, 0, 0] },
+      "rectification_matrix": { "rows": 3, "cols": 3, "data": [1, 0, 0, 0, 1, 0, 0, 0, 1] },
+      "projection_matrix": { "rows": 3, "cols": 4, "data": [1750, 0, 733, 0, 0, 1749, 549, 0, 0, 0, 1, 0] }
+    }
+  }
+}

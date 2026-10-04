@@ -301,6 +301,12 @@ def calibrate_samples(samples, size, square, k=2):
     不必再跑一遍完整检测（每张 100~800ms，300 张要算到 90 秒）。
     精修失败才退回完整检测。
     """
+    if not samples:
+        raise ValueError("没有可用样本")
+    if not np.isfinite(square) or square <= 0 or min(size) < 2:
+        raise ValueError("棋盘格尺寸及方格边长必须为正")
+    if any(sample.shape != samples[0].shape for sample in samples):
+        raise ValueError("样本分辨率不一致，请清空样本并保持相机分辨率固定")
     objpoints, imgpoints = [], []
     board = matching_points(size, square, "chessboard")
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 1e-4)
@@ -310,7 +316,7 @@ def calibrate_samples(samples, size, square, k=2):
         imgp = None
         if s.corners is not None and len(s.corners) == size[0] * size[1]:
             try:
-                c = np.asarray(s.corners, np.float32).reshape(-1, 1, 2)
+                c = np.asarray(s.corners, np.float32).reshape(-1, 1, 2).copy()
                 before = c.copy()      # cornerSubPix 修改入参并返回同一个对象 — 必须存副本
                 imgp = cv2.cornerSubPix(gray, c, (11, 11), (-1, -1), crit)
                 # 精修后验证：漂移超过 5px 或飞出图像边界 → 精修收敛到错误局部极值，
@@ -367,12 +373,13 @@ def calibrate_samples(samples, size, square, k=2):
     P[:3, :3] = ncm
 
     # 去畸变后角点偏离直线的程度（= ROS 界面里那个 lin.）
-    n = size[0]
-    und = cv2.undistortPoints(np.concatenate(imgpoints, 0).astype(np.float64), K, D)
-    lin = _linear_error(und.reshape(-1, n, 2))
+    # 分别检查每个视图的行/列；P=K 把归一化坐标转换回像素。
+    lin = float(np.mean([
+        _linear_error(cv2.undistortPoints(points.astype(np.float64), K, D, P=K)
+                      .reshape(size[1], size[0], 2)) for points in imgpoints]))
     return dict(rms=rms, K=K, D=D, P=P, per_view=per_view, image_size=image_size,
                 coverage=coverage, linear=lin, n_views=len(objpoints),
-                n_rejected=n_rejected, uv_range=uv_range)
+                n_rejected=n_rejected, uv_range=uv_range, pattern_size=tuple(size), square=square)
 
 
 def _linear_error(pts):
@@ -441,19 +448,27 @@ def build_report(driver, res, square, size, topic):
 def new_session(label):
     os.makedirs(RESULTS_ROOT, exist_ok=True)
     d = os.path.join(RESULTS_ROOT, time.strftime("%Y%m%d_%H%M%S_") + label)
-    os.makedirs(d, exist_ok=True)
+    base = d
+    suffix = 0
+    while True:
+        try:
+            os.mkdir(d)
+            break
+        except FileExistsError:
+            suffix += 1
+            d = base + "_%d" % suffix
     latest = os.path.join(RESULTS_ROOT, "latest")
     try:
         if os.path.islink(latest):
             os.remove(latest)
-        os.symlink(os.path.abspath(d), latest)
+        os.symlink(os.path.basename(d), latest)
     except OSError:
         pass
     return d
 
 
 def save_outputs(driver, res, samples, size, square, session=None, camera_name=None,
-                 ace_template=None):
+                 ace_template=None, topic=TOPIC):
     """把内参/报告/采集图/去畸变对比写到时间戳目录，返回目录路径。
 
     ace_template 给出且文件存在时，额外写一份 ACE27 相机配置 JSON（JSONC）：与模板同构，
@@ -477,23 +492,25 @@ def save_outputs(driver, res, samples, size, square, session=None, camera_name=N
 
     with open(os.path.join(session, "camera_info.yaml"), "w") as f:
         f.write(ros_yaml(cam, K, D, R, P, res["image_size"]))
-    report = build_report(driver, res, square, size, TOPIC)
+    report = build_report(driver, res, square, size, topic)
     with open(os.path.join(session, "检验报告.txt"), "w") as f:
         f.write(report + "\n")
 
     frames = os.path.join(session, "frames")
     os.makedirs(frames, exist_ok=True)
     for i, s in enumerate(samples):
-        cv2.imwrite(os.path.join(frames, "left-%04d.png" % i), s.gray(),
-                    [cv2.IMWRITE_PNG_COMPRESSION, 3])
+        path = os.path.join(frames, "left-%04d.png" % i)
+        if not cv2.imwrite(path, s.gray(), [cv2.IMWRITE_PNG_COMPRESSION, 3]):
+            raise OSError("无法保存采集图片：%s" % path)
 
     if samples:
         gray = samples[0].gray()
         mapx, mapy = cv2.initUndistortRectifyMap(K, D, R, ncm, res["image_size"], cv2.CV_32FC1)
         und = cv2.remap(gray, mapx, mapy, cv2.INTER_LINEAR)
-        cv2.imwrite(os.path.join(session, "去畸变对比.jpg"),
-                    np.hstack([cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
-                               cv2.cvtColor(und, cv2.COLOR_GRAY2BGR)]))
+        path = os.path.join(session, "去畸变对比.jpg")
+        if not cv2.imwrite(path, np.hstack([cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+                                           cv2.cvtColor(und, cv2.COLOR_GRAY2BGR)])):
+            raise OSError("无法保存去畸变对比图片：%s" % path)
 
     # ACE27 相机配置（可选）：以模板做文本替换，只动内参相关字段
     ace_name = "-"
@@ -537,25 +554,22 @@ class CameraThread(threading.Thread):
         self.lock = lock
         self.node = None
         self._sub = None
-        self._stop = False
+        self._stop_requested = False
         self._last_detect = 0.0
         self._fail_streak = 0
         self._last_ok_detect = 0.0
 
     def set_topic(self, topic):
-        self.topic = topic
-        if self.node is not None:
-            try:
-                self.node.destroy_subscription(self._sub)
-            except Exception:
-                pass
-            self._sub = self._make_sub()
+        self.topic = topic  # 由 ROS 线程切换订阅，避免主线程与 spin_once 并发销毁订阅。
 
     def _make_sub(self):
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import Image
-        return self.node.create_subscription(Image, self.topic, self.on_image,
-                                            qos_profile_sensor_data)
+        topic = self.topic
+        self._sub_topic = topic
+        return self.node.create_subscription(
+            Image, topic, lambda msg: self.on_image(msg) if topic == self.topic else None,
+            qos_profile_sensor_data)
 
     def on_image(self, msg):
         # 性能要点（实测，1440x1080 真实画面）：
@@ -582,6 +596,7 @@ class CameraThread(threading.Thread):
         with self.lock:
             self.state["decode_err"] = None
             size = self.state["size"]
+            generation = self.state.get("generation", 0)
             want = self.state["want_size"]
             undist = self.state["undist"]
             maps = self.state["maps"]
@@ -629,6 +644,8 @@ class CameraThread(threading.Thread):
             cv2.drawChessboardCorners(view, (int(size[0]), int(size[1])), pts, True)
 
         with self.lock:
+            if generation != self.state.get("generation", 0):
+                return   # 配置已重置，丢弃处理到一半的旧帧。
             self.state["native"] = (w, h)
             self.state["disp_rgb"] = view                 # 已是 RGB，UI 直接贴图
             self.state["bgr"] = view                      # 兼容“当前帧是否存在”的判断
@@ -643,8 +660,11 @@ class CameraThread(threading.Thread):
         self.node = Node("calib_gui")
         self._sub = self._make_sub()
         try:
-            while not self._stop:
+            while not self._stop_requested:
                 try:
+                    if self.topic != self._sub_topic:
+                        self.node.destroy_subscription(self._sub)
+                        self._sub = self._make_sub()
                     rclpy.spin_once(self.node, timeout_sec=0.2)
                 except Exception:
                     break          # 上下文被关掉时（rclpy.shutdown）正常退出
@@ -655,7 +675,7 @@ class CameraThread(threading.Thread):
                 pass
 
     def stop(self):
-        self._stop = True
+        self._stop_requested = True
 
 
 def _gray(bgr):
@@ -701,7 +721,7 @@ def main():
         RESULTS_ROOT = os.path.abspath(os.path.expanduser(args.results_dir))
 
     if args.self_test:
-        return self_test(size, args.square)
+        return self_test(size, args.square, args.ace_template)
 
     import tkinter as tk
     from tkinter import ttk
@@ -712,7 +732,7 @@ def main():
             self.root = root
             self.lock = threading.Lock()
             self.state = dict(bgr=None, gray=None, stamp=0.0, corners=None,
-                              ncorner=0, size=size, decode_err=None, disp_rgb=None,
+                              ncorner=0, size=size, square=args.square, generation=0, decode_err=None, disp_rgb=None,
                               want_size=None, undist=False, maps=None, interval=0.08)
             self.driver = args.driver
             self.topic = args.topic
@@ -720,6 +740,7 @@ def main():
             self.samples = []
             self.sample_params = []
             self.res = None
+            self.result_samples = []
             self.session = None
             self.driver_proc = None
             self.driver_env = None
@@ -764,6 +785,10 @@ def main():
             self.cam.start()
             self.log("就绪。驱动=%s 棋盘格=%dx%d 方格=%.1fmm 话题=%s"
                      % (DRIVERS[self.driver]["label"], size[0], size[1], args.square * 1000, self.topic))
+            if not os.path.isfile(self.ace_template):
+                self.log("提示：ACE 参考模板缺失：%s。可继续标定和保存 YAML；"
+                         "导出 ACE JSON 前请把参考文件放入 reference_json，或用 --ace-template 指定。"
+                         % self.ace_template)
             if getattr(args, "demo_switch", None):
                 tgt = args.demo_switch
                 self.log("自测：3 秒后自动切到【%s】并启动它" % DRIVERS[tgt]["label"])
@@ -881,7 +906,7 @@ def main():
             lf.grid(row=9, column=0, columnspan=2, sticky="nsew", pady=(4, 0))
             lf.columnconfigure(0, weight=1)
             lf.rowconfigure(0, weight=1)
-            self.log_text = tk.Text(lf, height=16, width=46, wrap="char",
+            self.log_text = tk.Text(lf, height=16, width=46, wrap="char", state="disabled",
                                     font=(getattr(self, "mono_family", None) or "TkFixedFont", 12))
             self.log_text.grid(row=0, column=0, sticky="nsew")
             sb = ttk.Scrollbar(lf, command=self.log_text.yview)
@@ -984,10 +1009,15 @@ def main():
         def log(self, msg):
             line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
             self.logq.put(line)
-            if os.environ.get("CALIB_GUI_DEBUG"):
+            if args.demo or os.environ.get("CALIB_GUI_DEBUG"):
                 print(line, flush=True)
 
         def on_driver_change(self, _evt=None):
+            if self._busy():
+                self.drv_var.set(DRIVERS[self.driver]["label"])
+                self.log("标定计算中，请完成后再切换驱动")
+                return
+            old_driver = self.driver
             label = self.drv_var.get()
             for k, d in DRIVERS.items():
                 if d["label"] == label:
@@ -997,6 +1027,8 @@ def main():
             if self._driver_running():
                 self.stop_driver()
                 self.log("切换驱动：已停止上一个驱动")
+            if old_driver != self.driver:
+                self.apply_size()
             self.driver_env = None
             self._last_param_sent.clear()
             self._load_driver_defaults()
@@ -1059,7 +1091,13 @@ def main():
             return True
 
         def resubscribe(self):
-            self.topic = self.topic_var.get().strip() or TOPIC
+            if self._busy():
+                self.log("标定计算中，请完成后再切换话题")
+                return
+            topic = self.topic_var.get().strip() or TOPIC
+            if topic != self.topic:
+                self.apply_size()
+            self.topic = topic
             self.cam.set_topic(self.topic)
             with self.lock:
                 self.state["bgr"] = None
@@ -1221,13 +1259,13 @@ def main():
 
         # ---------------- 标定 / 检验 / 输出 ----------------
         def _record_cover(self, corners, shape):
-            sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
+            sz = self.state["size"]
             prm = coverage_params(corners, (shape[1], shape[0]), sz)
             if prm:
                 self.sample_params.append(prm)
 
         def do_calibrate(self):
-            if getattr(self, "_calib_busy", False):
+            if self._busy():
                 self.log("上一次标定还在算，请稍候 ...")
                 return
             if len(self.samples) < MIN_SAMPLES:
@@ -1236,19 +1274,32 @@ def main():
                 return
             square = self.vars["sq"].get() / 1000.0
             sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
+            if sz != self.state["size"] or not np.isclose(square, self.state["square"], rtol=0, atol=1e-9):
+                self.log("棋盘格参数已修改，请先点【应用尺寸】并重新采集")
+                return
+            if self.auto_collect.get():
+                self.toggle_collect()
             samples = list(self.samples)
+            driver, topic = self.driver, self.topic
+            self.res = None
+            self.saved = self.checked = False
+            self.session = None
+            self.result_samples = []
+            self.res_var.set("标定计算中")
             self._calib_busy = True
             self._calib_result = None
             self._last_hint = None
             self.log("标定中 ...（%d 张样本，棋盘格 %dx%d，方格 %.1fmm）"
-                     "要逐张重新检测角点，可能要几秒到几十秒，窗口不会卡死"
+                     "正在精修角点并计算内参，窗口仍可操作"
                      % (len(samples), sz[0], sz[1], square * 1000))
             self.hint.set("标定计算中，请稍候 ...（窗口可以继续动）")
             self.root.update_idletasks()
 
             def work():
                 try:
-                    self._calib_result = ("ok", calibrate_samples(samples, sz, square, k=2))
+                    result = calibrate_samples(samples, sz, square, k=2)
+                    result.update(driver=driver, topic=topic)
+                    self._calib_result = ("ok", (result, samples))
                 except Exception as e:  # noqa: BLE001
                     self._calib_result = ("err", str(e))
 
@@ -1270,7 +1321,7 @@ def main():
             if kind == "err":
                 self.log("标定失败: %s（建议再采几张不同姿态，并确认尺寸/方格填对）" % payload)
                 return
-            self.res = payload
+            self.res, self.result_samples = payload
             self.checked = False
             self.saved = False
             r = self.res
@@ -1307,8 +1358,7 @@ def main():
             if not self.res:
                 self.log("还没标定，先点“标定”")
                 return
-            square = self.vars["sq"].get() / 1000.0
-            sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
+            square, sz = self.res["square"], self.res["pattern_size"]
             text = build_report(self.driver, self.res, square, sz, self.topic)
             self.session = self.session or new_session("%s_%dx%d" % (self.driver, sz[0], sz[1]))
             with open(os.path.join(self.session, "检验报告.txt"), "w") as f:
@@ -1330,32 +1380,68 @@ def main():
             txt.configure(state="disabled")
             tk.Button(win, text="关闭", command=win.destroy).grid(row=1, column=0, pady=6)
 
+        def _busy(self):
+            return getattr(self, "_calib_busy", False) or getattr(self, "_save_busy", False)
+
         def do_save(self):
+            if self._busy():
+                self.log("计算或保存尚未完成，请稍候")
+                return
             if not self.res:
                 self.log("还没标定，先点“标定”")
                 return
-            square = self.vars["sq"].get() / 1000.0
-            sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
-            self.session = save_outputs(self.driver, self.res, self.samples, sz, square,
-                                        session=self.session,
-                                        ace_template=self.ace_template)
-            # 本次运行的驱动日志一并归档（原始日志在 <结果根>/驱动日志/ 下）
+            result = self.res
+            square, sz = result["square"], result["pattern_size"]
+            samples = list(self.result_samples)
+            session = self.session
+            driver, template = self.driver, self.ace_template
             logf = getattr(self, "driver_log", None)
-            if logf and os.path.isfile(logf):
+            self.saved = False
+            self._save_busy = True
+            self._save_result = None
+            self.log("正在保存 %d 张原图、报告及标定结果 ..." % len(samples))
+
+            def work():
                 try:
-                    import shutil as _sh
-                    _sh.copyfile(logf, os.path.join(self.session, "驱动日志.log"))
-                except OSError:
-                    pass
-            self.saved = True
-            self.log("已输出到 %s" % self.session)
-            self.log("  %s" % ", ".join(sorted(os.listdir(self.session))))
+                    output = save_outputs(driver, result, samples, sz, square,
+                                          session=session, ace_template=template,
+                                          topic=result["topic"])
+                    if logf and os.path.isfile(logf):
+                        import shutil
+                        shutil.copyfile(logf, os.path.join(output, "驱动日志.log"))
+                    self._save_result = ("ok", output)
+                except Exception as exc:
+                    self._save_result = ("err", str(exc))
+
+            threading.Thread(target=work, daemon=True).start()
+
+        def _poll_save(self):
+            if not getattr(self, "_save_busy", False) or self._save_result is None:
+                return
+            kind, payload = self._save_result
+            self._save_result = None
+            self._save_busy = False
+            if kind == "err":
+                self.saved = False
+                self._write_after_save = False
+                self.log("保存失败：%s" % payload)
+                from tkinter import messagebox
+                messagebox.showerror("保存失败", payload, parent=self.root)
+            else:
+                self.session = payload
+                self.saved = True
+                self.log("已输出到 %s" % self.session)
+                self.log("  %s" % ", ".join(sorted(os.listdir(self.session))))
+                if getattr(self, "_write_after_save", False):
+                    self._write_after_save = False
+                    self.do_write_driver()
+            if getattr(self, "_exit_pending", False):
+                self.quit()
 
         def _build_ace_json(self):
             """按 ACE 模板渲染当前标定结果，返回 JSONC 文本。"""
             res = self.res
-            sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
-            square = self.vars["sq"].get() / 1000.0
+            sz, square = res["pattern_size"], res["square"]
             header = ace_json.build_header(
                 when=time.strftime("%Y-%m-%d %H:%M:%S"),
                 driver=DRIVERS[self.driver]["label"], pattern=sz,
@@ -1371,10 +1457,14 @@ def main():
             if not self.res:
                 self.log("还没标定，先点“标定”")
                 return
+            from tkinter import filedialog, messagebox
             if not os.path.isfile(self.ace_template):
-                self.log("ACE 模板不存在：%s（可用 --ace-template 指定）" % self.ace_template)
+                msg = ("ACE 参考模板不存在：\n%s\n\n请将参考文件放入项目的 reference_json 文件夹，"
+                       "或通过 --ace-template 指定。标定结果与 YAML 保存仍可正常使用。"
+                       % self.ace_template)
+                self.log(msg.replace("\n", " "))
+                messagebox.showerror("无法导出 ACE JSON", msg, parent=self.root)
                 return
-            from tkinter import filedialog
             default_name = ace_json.default_output_name(self.ace_template)
             path = filedialog.asksaveasfilename(
                 title="导出 ACE 相机配置 JSON", initialdir=self.session or HERE,
@@ -1382,17 +1472,25 @@ def main():
                 filetypes=[("JSON 配置", "*.json"), ("全部文件", "*.*")])
             if not path:
                 return
+            if os.path.realpath(path) == os.path.realpath(self.ace_template):
+                messagebox.showerror("无法导出 ACE JSON", "请选择其他保存位置，不能覆盖参考模板。", parent=self.root)
+                return
             try:
                 text = self._build_ace_json()
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(text)
             except Exception as e:                                        # noqa: BLE001
                 self.log("生成 ACE 配置失败：%s" % e)
+                messagebox.showerror("无法导出 ACE JSON", "参考模板：%s\n错误：%s"
+                                     % (self.ace_template, e), parent=self.root)
                 return
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(text)
             self.log("已导出 ACE 配置：%s（模板 %s，仅内参字段不同）"
                      % (path, os.path.basename(self.ace_template)))
 
         def do_write_driver(self):
+            if self._busy():
+                self.log("计算或保存尚未完成，请稍候")
+                return
             if not self.res:
                 self.log("还没标定，先点“标定”")
                 return
@@ -1402,7 +1500,9 @@ def main():
                 self.log("找不到驱动内参文件 %s" % cfg)
                 return
             if not self.session or not os.path.isfile(os.path.join(self.session, "camera_info.yaml")):
+                self._write_after_save = True
                 self.do_save()
+                return
             with open(cfg) as f:
                 old = f.read()
             with open(cfg + ".bak." + time.strftime("%Y%m%d_%H%M%S"), "w") as f:
@@ -1419,12 +1519,17 @@ def main():
             self.log("已写入驱动 %s（原文件已备份 .bak.*）" % cfg)
 
         def apply_size(self):
+            if self._busy():
+                self.log("标定计算中，请完成后再重新开始")
+                return
             sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
             self.samples.clear()
             self.sample_params = []
             self.sample_bytes = 0
             self._cap_warned = False
             self.res = None
+            self.result_samples = []
+            self.session = None
             self.mapx = self.mapy = None
             self._maps = None
             with self.lock:
@@ -1437,6 +1542,9 @@ def main():
             self.res_var.set("尚未标定")
             with self.lock:
                 self.state["size"] = sz
+                self.state["square"] = self.vars["sq"].get() / 1000.0
+                self.state["generation"] += 1
+                self.state.update(corners=None, gray=None, ncorner=0, stamp=0.0)
             self.log("尺寸已设为 %dx%d 内角点，方格 %.0fmm；已清空样本，重新开始采集"
                      % (sz[0], sz[1], self.vars["sq"].get()))
 
@@ -1507,7 +1615,7 @@ def main():
                 has_frame = self.state["bgr"] is not None
                 ncorner = self.state["ncorner"]
             running = self._driver_running()
-            busy = getattr(self, "_calib_busy", False)
+            busy = self._busy()
             decode_err = self.state.get("decode_err")
             det_ok = ncorner > 0 and (time.time() - self._last_corner_ts) < 2.5
 
@@ -1519,10 +1627,9 @@ def main():
             set_state("collect", has_frame and not busy)
             set_state("grab", has_frame and ncorner > 0 and not busy)
             set_state("calib", len(self.samples) >= MIN_SAMPLES and not busy)
-            set_state("check", self.res is not None)
-            set_state("save", self.res is not None)
-            set_state("ace", self.res is not None)
-            set_state("write", self.res is not None)
+            for key in ("check", "save", "ace", "write"):
+                set_state(key, self.res is not None and not busy)
+            set_state("apply", not busy)
 
             n = len(self.samples)
             prog = coverage_progress(self.sample_params)
@@ -1537,7 +1644,8 @@ def main():
             elif decode_err:
                 hint = "图像的像素格式不支持（%s）→ 把驱动改成 rgb8 或 mono8 后重试" % decode_err
             elif busy:
-                hint = "标定计算中，请稍候 ...（窗口可以继续动，算完会自动出结果）"
+                hint = ("正在保存结果，请稍候 ..." if getattr(self, "_save_busy", False)
+                        else "标定计算中，请稍候 ...（窗口可以继续动，算完会自动出结果）")
             elif step == 0:
                 hint = ("第 1 步：点【启动驱动】启动相机（相机插好、USB3 口直连）。"
                         "相机已在别处启动的话，等画面出现即可。")
@@ -1605,6 +1713,9 @@ def main():
                 self._drain_log()
                 self._update_image()
                 self._poll_calibration()
+                self._poll_save()
+                if getattr(self, "_quitting", False):
+                    return
                 self._check_publishers()
                 self._update_coverage()
                 self._refresh()
@@ -1659,16 +1770,20 @@ def main():
                 self.log("[诊断] 失败 %s" % e)
 
         def _drain_log(self):
-            n = 0
-            while n < 30:
+            lines = []
+            while len(lines) < 30:
                 try:
-                    line = self.logq.get_nowait()
+                    lines.append(self.logq.get_nowait())
                 except queue.Empty:
                     break
-                self.log_text.insert("end", line + "\n")
-                n += 1
-            if n:
-                self.log_text.see("end")
+            if lines:
+                # 仅程序追加日志时短暂解锁，输入、粘贴和删除均保持禁用。
+                self.log_text.configure(state="normal")
+                try:
+                    self.log_text.insert("end", "\n".join(lines) + "\n")
+                    self.log_text.see("end")
+                finally:
+                    self.log_text.configure(state="disabled")
 
         def _on_img_resize(self, event):
             """可用区域变化时，取其中最大的“相机宽高比”矩形，既放得最大又没有黑边。"""
@@ -1697,6 +1812,7 @@ def main():
                 corners = self.state["corners"]
                 ncorner = self.state["ncorner"]
                 stamp = self.state["stamp"]
+                gray = self.state["gray"]
             if rgb is None:
                 err = self.state.get("decode_err")
                 if err:
@@ -1705,8 +1821,10 @@ def main():
                     self.status.set("等待 %s 的图像 ...（先点“启动驱动”，或确认相机已插好）" % self.topic)
                 return
             now = time.time()
-            self._rate = [t for t in self._rate if now - t < 2.0] + [now]
-            fps = (len(self._rate) - 1) / 2.0
+            self._rate = [t for t in self._rate if now - t < 2.0]
+            if stamp != self._last_stamp:
+                self._rate.append(now)
+            fps = len(self._rate) / 2.0
             if stamp == self._last_stamp:
                 # 没有新帧就只更新状态栏，不重画（省 CPU）
                 self._set_status(ncorner, corners, fps, rgb.shape[1], rgb.shape[0])
@@ -1730,7 +1848,7 @@ def main():
                 self._last_corner_ts = now
             self._set_status(ncorner, corners, fps, w, h)
             if corners is not None:
-                self._maybe_auto_collect(corners, self.state["gray"])
+                self._maybe_auto_collect(corners, gray)
 
         def _set_status(self, ncorner, corners, fps, w, h):
             native = self._native_size or (w, h)
@@ -1749,6 +1867,11 @@ def main():
             self.do_calibrate()
 
         def quit(self):
+            if getattr(self, "_save_busy", False):
+                if not getattr(self, "_exit_pending", False):
+                    self.log("正在保存，完成后将自动退出")
+                self._exit_pending = True
+                return
             if getattr(self, "_quitting", False):
                 return
             self._quitting = True
@@ -1811,19 +1934,28 @@ def main():
             rclpy.shutdown()
         except Exception:
             pass
+    if args.demo and not app.saved:
+        print("演示失败：退出前未完成标定、检验和保存。", file=sys.stderr)
+        return 1
     return 0
 
 
 # =========================================================================== #
 # 无相机自检：用合成图画走完 检测→标定→检验→输出
 # =========================================================================== #
-def self_test(size, square):
+def self_test(size, square, ace_template=None):
     import tempfile
+    with tempfile.TemporaryDirectory(prefix="gui_selftest_") as tmp:
+        return _self_test(size, square, ace_template, tmp)
+
+
+def _self_test(size, square, ace_template, tmp):
     sys.path.insert(0, HERE)
     from selftest_synthetic import COLS, ROWS, SQ, K_GT, D_GT, make_dataset
 
     size, square = (COLS, ROWS), SQ          # 合成数据集固定为 8x6 内角点 / 25mm
-    tmp = tempfile.mkdtemp(prefix="gui_selftest_")
+    ace_template = (ace_template if ace_template and os.path.isfile(ace_template)
+                    else os.path.join(HERE, "tests", "fixtures", "ace_camera.json"))
     imgdir = os.path.join(tmp, "images")
     print("1) 合成标定图（真值 fx=%.2f, k1=%.5f）" % (K_GT[0, 0], D_GT[0]))
     make_dataset(imgdir)
@@ -1851,16 +1983,16 @@ def self_test(size, square):
 
     session = save_outputs("hik", res, samples, size, square,
                            session=os.path.join(tmp, "session"),
-                           ace_template=ace_json.DEFAULT_TEMPLATE)
+                           ace_template=ace_template)
     files = sorted(os.listdir(session))
     print("5) 输出目录 %s\n    %s" % (session, ", ".join(files)))
 
     # ACE27 相机配置：与模板比对，除内参字段外必须逐项一致
-    ace_name = ace_json.default_output_name(ace_json.DEFAULT_TEMPLATE)
+    ace_name = ace_json.default_output_name(ace_template)
     ace_ok, ace_detail = False, "模板不存在，跳过"
     if ace_name in files:
         try:
-            with open(ace_json.DEFAULT_TEMPLATE, encoding="utf-8") as f:
+            with open(ace_template, encoding="utf-8") as f:
                 tpl = json.loads(ace_json.strip_comments(f.read()))
             with open(os.path.join(session, ace_name), encoding="utf-8") as f:
                 got = json.loads(ace_json.strip_comments(f.read()))

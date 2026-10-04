@@ -25,7 +25,7 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 | **① 操作系统** | **Ubuntu 22.04 LTS**（代号 jammy） | 只走纯 OpenCV 路线时其它 Linux 也可（未验证） |
 | **② ROS 2 发行版** | **Humble**（软件包前缀 `ros-humble-*`） | 只有用到 ROS 的功能才需要；提供 `rclpy` / `sensor_msgs` / `image_transport` / `cv_bridge` |
 | Python | 3.10 | Ubuntu 22.04 自带，也是 Humble 官方支持的版本 |
-| 系统包 | `python3-numpy` `python3-opencv` `python3-yaml`<br>`python3-pil` `python3-pil.imagetk` `python3-tk` | ROS desktop 已带 numpy / opencv / yaml / tkinter；**PIL 要自己装**，且 Ubuntu 上 `python3-pil` 与 `python3-pil.imagetk` 是两个包（GUI 的 `ImageTk` 在后者里） |
+| 系统包 | `python3-numpy` `python3-opencv` `python3-yaml`<br>`python3-pil` `python3-pil.imagetk` `python3-tk` | 由安装脚本显式检查并安装；**不假设 ROS desktop 已装齐**，且 Ubuntu 上 `python3-pil` 与 `python3-pil.imagetk` 是两个包（GUI 的 `ImageTk` 在后者里） |
 | 中文字体 | `fonts-noto-cjk` | 缺它界面中文会显示成方框；程序仍能运行 |
 
 **一条命令装齐**（只装系统包，不动你的代码和标定结果）：
@@ -34,6 +34,53 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 ./install_deps.sh            # 检查并安装缺失的依赖
 ./install_deps.sh --check    # 只检查、只报告，不需要 sudo
 ```
+
+### 首次部署与 Python 环境
+
+`install_deps.sh` 和 `run_gui.sh` 统一使用 `/usr/bin/python3`，与 apt 和 ROS 的
+系统依赖保持一致。即使终端激活了 Conda/venv，启动脚本也不会误用其中的 Python；
+它会关闭用户 site-packages，清除继承的 `PYTHONHOME` / `PYTHONPATH`，再载入 ROS。
+这些处理只作用于脚本进程，不修改 `.bashrc`、虚拟环境或其他项目配置。
+
+安装检查同时核对 dpkg 的 **install ok installed** 状态和实际模块导入；
+安装后再次导入验证，失败时保留原始错误和模块路径，并返回非零退出码。
+`/usr/local` 下管理员通过 pip 安装的包仍可能覆盖 apt 包，模块路径会在检查中显示。
+
+```bash
+./install_deps.sh
+./install_deps.sh --check
+./run_gui.sh --self-test        # 不需要相机、桌面或 ROS；使用仓库内测试模板
+./run_gui.sh                    # 在桌面终端运行，需要已安装的 ROS 2
+```
+
+`requirements.txt` 用于纯 OpenCV 的独立 pip 环境。ROS GUI 推荐上面的 apt 路线，
+不要把 apt 安装的模块与隔离虚拟环境里的 `python3` 混用。
+ROS 本体和厂商相机驱动/SDK 需要另外准备；安装脚本会在已有 ROS 的情况下补齐
+`rclpy` 与 `sensor_msgs`，不会自动安装 ROS 官方标定编排的可选包。
+
+### ACE 参考文件与导出
+
+参考文件统一放在 `reference_json/`，默认模板是 `reference_json/uav.json`。
+可用 `ACE_TEMPLATE` 或 `--ace-template` 显式选择其他参考文件。
+模板缺失时启动日志会提示，图像订阅、标定和保存 YAML 仍正常；
+标定后点击【导出 ACE json】会弹窗说明缺失路径。
+导出只替换模板中的内参、畸变和投影字段，外参及采集参数来自参考文件。
+界面日志栏只读，可以选择和复制文字，不能输入、粘贴或删除日志。
+标定与保存均在后台执行；保存期间关闭窗口，会先保存完成再退出。
+重新标定生成新的结果目录；报告与导出使用实际标定参数，而非之后修改的滑条值。
+
+### 无相机验证真实 GUI
+
+```bash
+# 在已有 ROS 和桌面的机器上运行，输出到全新的测试目录
+./validate_deployment.sh /tmp/camera_calib_validation
+```
+
+脚本发布独立话题 `/calib_demo/image_raw`，默认使用 ROS domain 87，启动真实 Tk 窗口，
+自动执行采集 → 标定 → 检验 → 保存。退出后重新读取 YAML、图片和 ACE JSON，核对
+内参精度和文件内容；失败返回非零退出码。仅在指定目录生成日志和测试结果，
+不启动厂商驱动、不写真实相机配置。合成图测试不替代真实相机硬件验证。
+`tests/fixtures/ace_camera.json` 仅供测试，不是可部署到机器人上的相机配置。
 
 ### 组合兼容性
 
@@ -52,7 +99,7 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 |---|---|
 | `./ros2_calibrate.sh`（ROS 官方 cameracalibrator 编排） | `ros-humble-camera-calibration`、`ros-humble-image-pipeline`（**不在 desktop 里**，需单独装） |
 | 图形界面的【启动驱动】按钮 | 三个相机驱动的工作空间，见下方 `$CAMERA_ROOT` |
-| 【导出 ACE json】/ 输出 ACE 配置 | 一份 ACE 相机配置模板（默认找 `~/ACE27/config/cameras/uav.json`，可用 `ACE_TEMPLATE` 或 `--ace-template` 指定） |
+| 【导出 ACE json】/ 输出 ACE 配置 | 一份 ACE 相机配置模板（默认使用项目内 `reference_json/uav.json`，可用 `ACE_TEMPLATE` 或 `--ace-template` 指定） |
 | 纯 OpenCV 路线（`calibrate_mono.py` / `capture_chessboard.py` / `selftest_synthetic.py`） | **完全不需要 ROS**，只要 numpy + opencv（Pillow 仅 `capture_chessboard.py` 叠中文时用） |
 
 ### 版本兼容性（已实测）
@@ -75,12 +122,12 @@ MIT License，见 [LICENSE](LICENSE)。Copyright (c) 2026 Acuteluo。
 ## 快速开始
 
 ```bash
-git clone <仓库地址> ~/camera_calib && cd ~/camera_calib
+git clone https://github.com/Acuteluo/camera_calib.git ~/camera_calib && cd ~/camera_calib
 ./install_deps.sh              # 装依赖（ROS 2 需你事先装好）
 
 # 自检：不需要相机，约 30 秒跑完
 python3 selftest_synthetic.py  # 纯 OpenCV 全链路（合成图反解内参，13 项断言）
-python3 calib_gui.py --self-test   # 界面逻辑 + ACE 配置渲染
+./run_gui.sh --self-test       # 界面逻辑 + ACE 配置渲染；无需 ROS/桌面/外部模板
 ```
 
 三条使用路线，按需选一条：
@@ -413,7 +460,7 @@ self.P[:3, :3] = ncm
 
 | 文件 | 作用 |
 |---|---|
-| `install_deps.sh` | **一键装依赖**：`./install_deps.sh` 安装 / `--check` 只检查（开源后第一步就跑它） |
+| `install_deps.sh` | **一键装依赖并验证实际 Python 导入**：`./install_deps.sh` 安装 / `--check` 只检查（开源后第一步就跑它） |
 | `run_gui.sh` + `calib_gui.py` | **图形化标定程序**（全中文界面：步骤引导、灰按钮、曝光/增益滑条+输入框、检验报告、导出 ACE 配置） |
 | `ace_json.py` | ACE27 相机配置渲染库：以 `ACE27/config/cameras/*.json` 为模板做文本替换，只换内参字段，注释/键序/缩进逐字节保留 |
 | `ace_export.py` | **一键把历史标定结果转成 ACE JSON**：`python3 ace_export.py --dry-run` 看计划 → `python3 ace_export.py` 生成（只新增、不覆盖、不删除） |
@@ -434,7 +481,7 @@ self.P[:3, :3] = ncm
 
 ```bash
 python3 ~/camera_calib/selftest_synthetic.py
-python3 ~/camera_calib/calib_gui.py --self-test      # 含 ACE JSON 渲染校验
+~/camera_calib/run_gui.sh --self-test      # 含 ACE JSON 渲染校验
 python3 ~/camera_calib/ace_json.py --self-test       # 只校验模板渲染
 ```
 

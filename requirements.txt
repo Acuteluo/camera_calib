@@ -4,13 +4,16 @@
 #     ./install_deps.sh        # 用 apt 装齐所有依赖（推荐，与 ROS 自带的 OpenCV 版本一致）
 #
 # 什么时候用本文件：
-#   * 不用 apt 包管理（例如 Conda / venv 环境）；
+#   * 不用 apt 包管理，只运行纯 OpenCV 工具（例如 Conda / venv 环境）；
 #   * 系统里没有 ROS，只想跑纯 OpenCV 路线（calibrate_mono.py / capture_chessboard.py）；
 #   * 想用更新版 OpenCV（注意：apt 的 4.5.4 已足够，见 README「版本兼容性」）。
 #
-#     pip install -r requirements.txt
+# ROS GUI 请使用 ./install_deps.sh 与 ./run_gui.sh（系统 Python）。
+# tkinter 不是 pip 包，需由操作系统提供。
+#     python3 -m pip install -r requirements.txt
 
 numpy>=1.21
-opencv-python>=4.5
+# contrib 包同时提供 ChArUco；不要与 opencv-python 混装。
+opencv-contrib-python>=4.5
 PyYAML>=5.4
 Pillow>=8.0
