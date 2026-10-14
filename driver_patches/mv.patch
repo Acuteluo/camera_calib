@@ -1,0 +1,619 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,16 +28,30 @@
+   src/mv_camera_node.cpp
+ )
+ 
+-# 添加 SDK 头文件路径
+-target_include_directories(${PROJECT_NAME} PUBLIC mvsdk/include)
++# 编译头文件和安装运行库统一来自同一套 SDK；默认使用包内版本。
++set(MV_SDK_ROOT "$ENV{MV_SDK_ROOT}" CACHE PATH
++  "Root directory of the MindVision SDK (defaults to the bundled SDK)")
++if(NOT MV_SDK_ROOT)
++  set(MV_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/mvsdk")
++endif()
++if(NOT EXISTS "${MV_SDK_ROOT}/include/CameraApi.h")
++  message(FATAL_ERROR "MindVision SDK headers not found under ${MV_SDK_ROOT}")
++endif()
++target_include_directories(${PROJECT_NAME} PUBLIC "${MV_SDK_ROOT}/include")
+ 
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC mvsdk/lib/amd64)
++  set(MV_SDK_LIB_DIR "${MV_SDK_ROOT}/lib/amd64")
+ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC mvsdk/lib/arm64)
++  set(MV_SDK_LIB_DIR "${MV_SDK_ROOT}/lib/arm64")
+ else()
+-  message(FATAL_ERROR "Unsupport host system architecture: ${CMAKE_HOST_SYSTEM_PROCESSOR}!")
++  message(FATAL_ERROR "Unsupported target architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
++if(NOT EXISTS "${MV_SDK_LIB_DIR}/libMVSDK.so")
++  message(FATAL_ERROR "MindVision SDK library not found: ${MV_SDK_LIB_DIR}/libMVSDK.so")
++endif()
++target_link_directories(${PROJECT_NAME} PUBLIC "${MV_SDK_LIB_DIR}")
++# 把选定 SDK 的运行库装入 overlay，避免运行时意外解析到系统旧版本。
++install(DIRECTORY "${MV_SDK_LIB_DIR}/" DESTINATION lib)
+ 
+ # 链接 SDK 库
+ target_link_libraries(${PROJECT_NAME} MVSDK)
+--- a/src/mv_camera_node.cpp
++++ b/src/mv_camera_node.cpp
+@@ -14,6 +14,9 @@
+ 
+ // C++ system
+ #include <memory>   // 智能指针
++#include <cstring>
++#include <cmath>
++#include <stdexcept>
+ #include <string>
+ #include <thread>  // 线程
+ #include <vector>
+@@ -27,64 +30,151 @@
+   {
+     RCLCPP_INFO(this->get_logger(), "Starting MVCameraNode!");
+ 
+-    CameraSdkInit(1);
+-
+-    // 枚举设备，并建立设备列表
+-    int i_camera_counts = 1; 
+-    int i_status = -1;
+-    tSdkCameraDevInfo t_camera_enum_list;
+-    i_status = CameraEnumerateDevice(&t_camera_enum_list, &i_camera_counts);
++    const std::string requested_serial = this->declare_parameter<std::string>("camera_serial", "");
++    int i_status = CameraSdkInit(1);
++    if (i_status != CAMERA_STATUS_SUCCESS) {
++      RCLCPP_FATAL(this->get_logger(), "MindVision SDK init failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
++
++    // SDK 要求传入列表容量；固定容量到顶时直接报错，避免截断后误选设备。
++    constexpr int kMaxCameraCount = 64;
++    std::vector<tSdkCameraDevInfo> camera_list(kMaxCameraCount);
++    int i_camera_counts = kMaxCameraCount;
++    i_status = CameraEnumerateDevice(camera_list.data(), &i_camera_counts);
+     RCLCPP_INFO(this->get_logger(), "Enumerate state = %d", i_status);
+     RCLCPP_INFO(this->get_logger(), "Found camera count = %d", i_camera_counts);
+ 
+-    // 没有连接设备
++    if (i_status != CAMERA_STATUS_SUCCESS || i_camera_counts < 0 ||
++        i_camera_counts >= kMaxCameraCount) {
++      RCLCPP_FATAL(this->get_logger(), "MindVision enumeration failed or exceeded %d devices (status=%d, count=%d)",
++        kMaxCameraCount, i_status, i_camera_counts);
++      rclcpp::shutdown();
++      return;
++    }
+     if (i_camera_counts == 0) {
+-      RCLCPP_ERROR(this->get_logger(), "No camera found!");
++      RCLCPP_FATAL(this->get_logger(), "No MindVision camera found");
++      rclcpp::shutdown();
++      return;
++    }
++    if (requested_serial.empty() && i_camera_counts > 1) {
++      RCLCPP_FATAL(this->get_logger(),
++        "Multiple MindVision cameras found; set camera_serial to select exactly one");
++      rclcpp::shutdown();
++      return;
++    }
++
++    int selected_index = -1;
++    int match_count = 0;
++    for (int i = 0; i < i_camera_counts; ++i) {
++      const std::string serial(camera_list[i].acSn,
++        strnlen(camera_list[i].acSn, sizeof(camera_list[i].acSn)));
++      const std::string model(camera_list[i].acProductName,
++        strnlen(camera_list[i].acProductName, sizeof(camera_list[i].acProductName)));
++      RCLCPP_INFO(this->get_logger(), "Camera candidate model=%s serial=%s", model.c_str(),
++        serial.empty() ? "unknown" : serial.c_str());
++      if (requested_serial.empty() ? i_camera_counts == 1 : serial == requested_serial) {
++        selected_index = i;
++        ++match_count;
++      }
++    }
++    if (match_count != 1) {
++      if (match_count == 0) {
++        RCLCPP_FATAL(this->get_logger(), "No camera matches camera_serial='%s'", requested_serial.c_str());
++      } else {
++        RCLCPP_FATAL(this->get_logger(),
++          "Multiple cameras found; set camera_serial to select exactly one");
++      }
++      rclcpp::shutdown();
+       return;
+     }
+ 
+     // 相机初始化。初始化成功后，才能调用任何其他相机相关的操作接口
+-    i_status = CameraInit(&t_camera_enum_list, -1, -1, &h_camera_);
++    i_status = CameraInit(&camera_list[selected_index], -1, -1, &h_camera_);
+ 
+     // 初始化失败
+     RCLCPP_INFO(this->get_logger(), "Init state = %d", i_status);
+     if (i_status != CAMERA_STATUS_SUCCESS) {
+-      RCLCPP_ERROR(this->get_logger(), "Init failed!");
+-      return;
+-    }
++      RCLCPP_FATAL(this->get_logger(), "MindVision camera init failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
++    camera_initialized_ = true;
++    camera_serial_ = std::string(camera_list[selected_index].acSn,
++      strnlen(camera_list[selected_index].acSn, sizeof(camera_list[selected_index].acSn)));
++    if (camera_serial_.empty()) camera_serial_ = "unknown";
++    camera_model_ = std::string(camera_list[selected_index].acProductName,
++      strnlen(camera_list[selected_index].acProductName,
++        sizeof(camera_list[selected_index].acProductName)));
++    RCLCPP_INFO(this->get_logger(),
++      "CALIB_SELECTED_CAMERA serial=%s transport=unknown model=%s",
++      camera_serial_.c_str(), camera_model_.c_str());
+ 
+     // 获得相机的特性描述结构体。该结构体中包含了相机可设置的各种参数的范围信息。决定了相关函数的参数
+-    CameraGetCapability(h_camera_, &t_capability_);
+-
+-    // 直接使用vector的内存作为相机输出buffer
+-    image_msg_.data.reserve(
+-      t_capability_.sResolutionRange.iHeightMax * t_capability_.sResolutionRange.iWidthMax * 3);
++    i_status = CameraGetCapability(h_camera_, &t_capability_);
++    if (i_status != CAMERA_STATUS_SUCCESS) {
++      RCLCPP_FATAL(this->get_logger(), "CameraGetCapability failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
++    mono_sensor_ = t_capability_.sIspCapacity.bMonoSensor != 0;
+ 
+     // 设置手动曝光
+     CameraSetAeState(h_camera_, false);
+ 
+-    // Declare camera parameters
+-    declareParameters();
+-
+-    // 让SDK进入工作模式，开始接收来自相机发送的图像
+-    // 数据。如果当前相机是触发模式，则需要接收到
+-    // 触发帧以后才会更新图像。
+-    CameraPlay(h_camera_);
+-
+-    CameraSetIspOutFormat(h_camera_, CAMERA_MEDIA_TYPE_RGB8);
++    // ROS 参数越界等情况会从构造函数抛异常；对象析构函数不会运行，因此这里先释放 SDK 句柄。
++    try {
++      declareParameters();
++    } catch (...) {
++      cleanupCamera();
++      throw;
++    }
++
++    // 相机黑白传感器输出 Mono8，再复制为 RGB 三通道以保持 ROS 话题 encoding 一致。
++    i_status = CameraSetIspOutFormat(h_camera_,
++      mono_sensor_ ? CAMERA_MEDIA_TYPE_MONO8 : CAMERA_MEDIA_TYPE_RGB8);
++    if (i_status != CAMERA_STATUS_SUCCESS) {
++      RCLCPP_FATAL(this->get_logger(), "CameraSetIspOutFormat failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
++
++    i_status = CameraSetTriggerMode(h_camera_, 0);
++    if (i_status != CAMERA_STATUS_SUCCESS) {
++      RCLCPP_FATAL(this->get_logger(), "CameraSetTriggerMode(continuous) failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
++    int trigger_mode = -1;
++    i_status = CameraGetTriggerMode(h_camera_, &trigger_mode);
++    if (i_status != CAMERA_STATUS_SUCCESS || trigger_mode != 0) {
++      RCLCPP_FATAL(this->get_logger(),
++        "Failed to verify continuous trigger mode (status=%d, mode=%d)", i_status, trigger_mode);
++      rclcpp::shutdown();
++      return;
++    }
++
++    // 让 SDK 开始连续获取图像；节点只处理成功设置的传感器输出格式。
++    i_status = CameraPlay(h_camera_);
++    if (i_status != CAMERA_STATUS_SUCCESS) {
++      RCLCPP_FATAL(this->get_logger(), "CameraPlay failed, status = %d", i_status);
++      rclcpp::shutdown();
++      return;
++    }
+ 
+     // Create camera publisher
+     // rqt_image_view can't subscribe image msg with sensor_data QoS
+     // https://github.com/ros-visualization/rqt/issues/187
+-    bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", false);
++    bool use_sensor_data_qos = declareCameraParameter<bool>("use_sensor_data_qos", false);
+     auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+     camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos); // 声明相机图像发布话题 image_raw
+ 
+     // Load camera info from "camera_info.yaml"
+-    camera_name_ = this->declare_parameter("camera_name", "mv_camera");
++    camera_name_ = declareCameraParameter<std::string>("camera_name", "mv_camera");
+     camera_info_manager_ =
+       std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
+-    auto camera_info_url = this->declare_parameter(
++    auto camera_info_url = declareCameraParameter<std::string>(
+       "camera_info_url", "package://mindvision_camera/config/camera_info.yaml");
+     if (camera_info_manager_->validateURL(camera_info_url)) {
+       camera_info_manager_->loadCameraInfo(camera_info_url);
+@@ -107,17 +197,56 @@
+       while (rclcpp::ok()) {
+         int status = CameraGetImageBuffer(h_camera_, &s_frame_info_, &pby_buffer_, 1000); // 超时时间 1s
+         if (status == CAMERA_STATUS_SUCCESS) { // 成功则调用 CameraImageProcess 将原始 Bayer 数据转为 RGB8，存入 image_msg_.data
+-          CameraImageProcess(h_camera_, pby_buffer_, image_msg_.data.data(), &s_frame_info_);
++          const size_t width = s_frame_info_.iWidth > 0 ?
++            static_cast<size_t>(s_frame_info_.iWidth) : 0;
++          const size_t height = s_frame_info_.iHeight > 0 ?
++            static_cast<size_t>(s_frame_info_.iHeight) : 0;
++          const size_t pixels = width * height;
++          const size_t channels = mono_sensor_ ? 1 : 3;
++          if (width == 0 || height == 0) {
++            RCLCPP_ERROR(this->get_logger(), "Invalid MindVision frame size (%d x %d)",
++              s_frame_info_.iWidth, s_frame_info_.iHeight);
++            CameraReleaseImageBuffer(h_camera_, pby_buffer_);
++            ++fail_conut_;
++            if (fail_conut_ > 5) {
++              RCLCPP_FATAL(this->get_logger(), "Repeated invalid frame sizes, exit!");
++              rclcpp::shutdown();
++            }
++            continue;
++          }
++          // data() 必须指向已 resize 的有效输出区，reserve 只预留容量并不构造元素。
++          image_msg_.data.resize(pixels * channels);
++          status = CameraImageProcess(h_camera_, pby_buffer_, image_msg_.data.data(), &s_frame_info_);
++          if (status != CAMERA_STATUS_SUCCESS) {
++            RCLCPP_ERROR(this->get_logger(), "CameraImageProcess failed, status = %d", status);
++            CameraReleaseImageBuffer(h_camera_, pby_buffer_);
++            ++fail_conut_;
++            if (fail_conut_ > 5) {
++              RCLCPP_FATAL(this->get_logger(), "Repeated image conversion failures, exit!");
++              rclcpp::shutdown();
++            }
++            continue;
++          }
+           if (flip_image_) {
+             CameraFlipFrameBuffer(image_msg_.data.data(), &s_frame_info_, 3);
+           }
+ 
++          if (mono_sensor_) {
++            // 原地逆序扩展，避免额外的大帧临时缓冲区。
++            image_msg_.data.resize(pixels * 3);
++            for (size_t i = pixels; i > 0; --i) {
++              const uint8_t value = image_msg_.data[i - 1];
++              image_msg_.data[3 * (i - 1)] = value;
++              image_msg_.data[3 * (i - 1) + 1] = value;
++              image_msg_.data[3 * (i - 1) + 2] = value;
++            }
++          }
++
+           // 填充图像数据
+           camera_info_msg_.header.stamp = image_msg_.header.stamp = this->now();
+-          image_msg_.height = s_frame_info_.iHeight;
+-          image_msg_.width = s_frame_info_.iWidth;
+-          image_msg_.step = s_frame_info_.iWidth * 3;
+-          image_msg_.data.resize(s_frame_info_.iWidth * s_frame_info_.iHeight * 3);
++          image_msg_.height = static_cast<uint32_t>(height);
++          image_msg_.width = static_cast<uint32_t>(width);
++          image_msg_.step = static_cast<uint32_t>(width * 3);
+ 
+           camera_pub_.publish(image_msg_, camera_info_msg_);
+ 
+@@ -146,12 +275,38 @@
+       capture_thread_.join();
+     }
+ 
+-    CameraUnInit(h_camera_);
++    if (camera_initialized_) {
++      cleanupCamera();
++    }
+ 
+     RCLCPP_INFO(this->get_logger(), "Camera node destroyed!");
+   }
+ 
+ private:
++  void cleanupCamera() noexcept
++  {
++    if (camera_initialized_) {
++      CameraUnInit(h_camera_);
++      camera_initialized_ = false;
++    }
++  }
++
++  template<typename T>
++  T declareCameraParameter(
++    const std::string & name, const T & default_value,
++    const rcl_interfaces::msg::ParameterDescriptor * descriptor = nullptr)
++  {
++    try {
++      if (descriptor != nullptr) {
++        return this->declare_parameter<T>(name, default_value, *descriptor);
++      }
++      return this->declare_parameter<T>(name, default_value);
++    } catch (...) {
++      cleanupCamera();
++      throw;
++    }
++  }
++
+   void declareParameters()
+   {
+     rcl_interfaces::msg::ParameterDescriptor param_desc;
+@@ -160,69 +315,136 @@
+ 
+     // Exposure time
+     param_desc.description = "Exposure time in microseconds";
+-    // 对于CMOS传感器，其曝光的单位是按照行来计算的
+-    double exposure_line_time;
+-    CameraGetExposureLineTime(h_camera_, &exposure_line_time);
+-    param_desc.integer_range[0].from_value =
+-      t_capability_.sExposeDesc.uiExposeTimeMin * exposure_line_time;
+-    param_desc.integer_range[0].to_value =
+-      t_capability_.sExposeDesc.uiExposeTimeMax * exposure_line_time;
+-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
+-    CameraSetExposureTime(h_camera_, exposure_time);
+-    RCLCPP_INFO(this->get_logger(), "Exposure time = %f", exposure_time);
++    double exposure_min = 0.0;
++    double exposure_max = 0.0;
++    double exposure_step = 0.0;
++    int status = CameraGetExposureTimeRange(
++      h_camera_, &exposure_min, &exposure_max, &exposure_step);
++    if (status != CAMERA_STATUS_SUCCESS || !std::isfinite(exposure_min) ||
++        !std::isfinite(exposure_max) || !std::isfinite(exposure_step) ||
++        exposure_step <= 0.0 || exposure_min > exposure_max) {
++      throw std::runtime_error("CameraGetExposureTimeRange failed or returned an invalid range");
++    }
++    double current_exposure = 0.0;
++    status = CameraGetExposureTime(h_camera_, &current_exposure);
++    if (status != CAMERA_STATUS_SUCCESS || !std::isfinite(current_exposure)) {
++      throw std::runtime_error("CameraGetExposureTime failed");
++    }
++    const int64_t exposure_min_int = static_cast<int64_t>(std::ceil(exposure_min));
++    const int64_t exposure_max_int = static_cast<int64_t>(std::floor(exposure_max));
++    if (exposure_min_int > exposure_max_int) {
++      throw std::runtime_error("MindVision exposure range has no integer microsecond value");
++    }
++    int64_t exposure_default = static_cast<int64_t>(std::llround(current_exposure));
++    if (exposure_default < exposure_min_int) exposure_default = exposure_min_int;
++    if (exposure_default > exposure_max_int) exposure_default = exposure_max_int;
++    param_desc.integer_range[0].from_value = exposure_min_int;
++    param_desc.integer_range[0].to_value = exposure_max_int;
++    const int64_t exposure_time = declareCameraParameter<int64_t>(
++      "exposure_time", exposure_default, &param_desc);
++    status = CameraSetExposureTime(h_camera_, static_cast<double>(exposure_time));
++    if (status != CAMERA_STATUS_SUCCESS) {
++      throw std::runtime_error("CameraSetExposureTime failed, status=" + std::to_string(status));
++    }
++    RCLCPP_INFO(this->get_logger(), "Exposure time = %f", static_cast<double>(exposure_time));
+ 
+     // Analog gain
+     param_desc.description = "Analog gain";
+-    param_desc.integer_range[0].from_value = t_capability_.sExposeDesc.uiAnalogGainMin;
+-    param_desc.integer_range[0].to_value = t_capability_.sExposeDesc.uiAnalogGainMax;
+-    int analog_gain;
+-    CameraGetAnalogGain(h_camera_, &analog_gain);
+-    analog_gain = this->declare_parameter("analog_gain", analog_gain, param_desc);
+-    CameraSetAnalogGain(h_camera_, analog_gain);
+-    RCLCPP_INFO(this->get_logger(), "Analog gain = %d", analog_gain);
+-
+-    // RGB Gain
+-    // Get default value
+-    CameraGetGain(h_camera_, &r_gain_, &g_gain_, &b_gain_);
+-    // R Gain
+-    param_desc.integer_range[0].from_value = t_capability_.sRgbGainRange.iRGainMin;
+-    param_desc.integer_range[0].to_value = t_capability_.sRgbGainRange.iRGainMax;
+-    r_gain_ = this->declare_parameter("rgb_gain.r", r_gain_, param_desc);
+-    // G Gain
+-    param_desc.integer_range[0].from_value = t_capability_.sRgbGainRange.iGGainMin;
+-    param_desc.integer_range[0].to_value = t_capability_.sRgbGainRange.iGGainMax;
+-    g_gain_ = this->declare_parameter("rgb_gain.g", g_gain_, param_desc);
+-    // B Gain
+-    param_desc.integer_range[0].from_value = t_capability_.sRgbGainRange.iBGainMin;
+-    param_desc.integer_range[0].to_value = t_capability_.sRgbGainRange.iBGainMax;
+-    b_gain_ = this->declare_parameter("rgb_gain.b", b_gain_, param_desc);
+-    // Set gain
+-    CameraSetGain(h_camera_, r_gain_, g_gain_, b_gain_);
+-    RCLCPP_INFO(this->get_logger(), "RGB Gain: R = %d", r_gain_);
+-    RCLCPP_INFO(this->get_logger(), "RGB Gain: G = %d", g_gain_);
+-    RCLCPP_INFO(this->get_logger(), "RGB Gain: B = %d", b_gain_);
+-
+-    // Saturation
+-    param_desc.description = "Saturation";
+-    param_desc.integer_range[0].from_value = t_capability_.sSaturationRange.iMin;
+-    param_desc.integer_range[0].to_value = t_capability_.sSaturationRange.iMax;
+-    int saturation;
+-    CameraGetSaturation(h_camera_, &saturation);
+-    saturation = this->declare_parameter("saturation", saturation, param_desc);
+-    CameraSetSaturation(h_camera_, saturation);
+-    RCLCPP_INFO(this->get_logger(), "Saturation = %d", saturation);
+-
+-    // Gamma
++    const int64_t analog_gain_min = t_capability_.sExposeDesc.uiAnalogGainMin;
++    const int64_t analog_gain_max = t_capability_.sExposeDesc.uiAnalogGainMax;
++    if (analog_gain_min > analog_gain_max) {
++      throw std::runtime_error("MindVision reported an invalid analog gain range");
++    }
++    int analog_gain_current = 0;
++    status = CameraGetAnalogGain(h_camera_, &analog_gain_current);
++    if (status != CAMERA_STATUS_SUCCESS) {
++      throw std::runtime_error("CameraGetAnalogGain failed, status=" + std::to_string(status));
++    }
++    param_desc.integer_range[0].from_value = analog_gain_min;
++    param_desc.integer_range[0].to_value = analog_gain_max;
++    const int64_t analog_gain = declareCameraParameter<int64_t>(
++      "analog_gain", analog_gain_current, &param_desc);
++    status = CameraSetAnalogGain(h_camera_, static_cast<int>(analog_gain));
++    if (status != CAMERA_STATUS_SUCCESS) {
++      throw std::runtime_error("CameraSetAnalogGain failed, status=" + std::to_string(status));
++    }
++    RCLCPP_INFO(this->get_logger(), "Analog gain = %d", static_cast<int>(analog_gain));
++
++    // 黑白传感器没有 RGB 数字增益和饱和度能力，避免调用不支持的 SDK getter/setter。
++    if (!mono_sensor_) {
++      int gain_min[3] = {
++        t_capability_.sRgbGainRange.iRGainMin,
++        t_capability_.sRgbGainRange.iGGainMin,
++        t_capability_.sRgbGainRange.iBGainMin};
++      int gain_max[3] = {
++        t_capability_.sRgbGainRange.iRGainMax,
++        t_capability_.sRgbGainRange.iGGainMax,
++        t_capability_.sRgbGainRange.iBGainMax};
++      int * gains[3] = {&r_gain_, &g_gain_, &b_gain_};
++      const char * names[3] = {"rgb_gain.r", "rgb_gain.g", "rgb_gain.b"};
++      status = CameraGetGain(h_camera_, &r_gain_, &g_gain_, &b_gain_);
++      if (status != CAMERA_STATUS_SUCCESS) {
++        throw std::runtime_error("CameraGetGain failed, status=" + std::to_string(status));
++      }
++      for (int i = 0; i < 3; ++i) {
++        if (gain_min[i] > gain_max[i]) {
++          throw std::runtime_error("MindVision reported an invalid RGB gain range");
++        }
++        param_desc.description = "RGB digital gain";
++        param_desc.integer_range[0].from_value = gain_min[i];
++        param_desc.integer_range[0].to_value = gain_max[i];
++        *gains[i] = static_cast<int>(declareCameraParameter<int64_t>(
++          names[i], *gains[i], &param_desc));
++      }
++      status = CameraSetGain(h_camera_, r_gain_, g_gain_, b_gain_);
++      if (status != CAMERA_STATUS_SUCCESS) {
++        throw std::runtime_error("CameraSetGain failed, status=" + std::to_string(status));
++      }
++      RCLCPP_INFO(this->get_logger(), "RGB Gain: R=%d G=%d B=%d", r_gain_, g_gain_, b_gain_);
++
++      param_desc.description = "Saturation";
++      const int saturation_min = t_capability_.sSaturationRange.iMin;
++      const int saturation_max = t_capability_.sSaturationRange.iMax;
++      if (saturation_min > saturation_max) {
++        throw std::runtime_error("MindVision reported an invalid saturation range");
++      }
++      int saturation_current = 0;
++      status = CameraGetSaturation(h_camera_, &saturation_current);
++      if (status != CAMERA_STATUS_SUCCESS) {
++        throw std::runtime_error("CameraGetSaturation failed, status=" + std::to_string(status));
++      }
++      param_desc.integer_range[0].from_value = saturation_min;
++      param_desc.integer_range[0].to_value = saturation_max;
++      const int64_t saturation = declareCameraParameter<int64_t>(
++        "saturation", saturation_current, &param_desc);
++      status = CameraSetSaturation(h_camera_, static_cast<int>(saturation));
++      if (status != CAMERA_STATUS_SUCCESS) {
++        throw std::runtime_error("CameraSetSaturation failed, status=" + std::to_string(status));
++      }
++      RCLCPP_INFO(this->get_logger(), "Saturation = %d", static_cast<int>(saturation));
++    }
++
++    // Gamma 是可选 ISP 能力；不支持或读取失败时跳过参数，保留相机默认状态。
+     param_desc.integer_range[0].from_value = t_capability_.sGammaRange.iMin;
+     param_desc.integer_range[0].to_value = t_capability_.sGammaRange.iMax;
+-    int gamma;
+-    CameraGetGamma(h_camera_, &gamma);
+-    gamma = this->declare_parameter("gamma", gamma, param_desc);
+-    CameraSetGamma(h_camera_, gamma);
+-    RCLCPP_INFO(this->get_logger(), "Gamma = %d", gamma);
++    int gamma_current = 0;
++    status = CameraGetGamma(h_camera_, &gamma_current);
++    if (status != CAMERA_STATUS_SUCCESS ||
++        t_capability_.sGammaRange.iMin > t_capability_.sGammaRange.iMax) {
++      RCLCPP_WARN(this->get_logger(), "Gamma is unavailable; skip gamma parameter (status=%d)", status);
++    } else {
++      const int64_t gamma = declareCameraParameter<int64_t>("gamma", gamma_current, &param_desc);
++      status = CameraSetGamma(h_camera_, static_cast<int>(gamma));
++      if (status == CAMERA_STATUS_SUCCESS) {
++        gamma_supported_ = true;
++        RCLCPP_INFO(this->get_logger(), "Gamma = %d", static_cast<int>(gamma));
++      } else {
++        RCLCPP_WARN(this->get_logger(), "CameraSetGamma failed, skip gamma control (status=%d)", status);
++      }
++    }
+ 
+     // Flip
+-    flip_image_ = this->declare_parameter("flip_image", false);
++    flip_image_ = declareCameraParameter<bool>("flip_image", false);
+   }
+ 
+   rcl_interfaces::msg::SetParametersResult parametersCallback(
+@@ -244,6 +466,11 @@
+           result.reason = "Failed to set analog gain, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "rgb_gain.r") {
++        if (mono_sensor_) {
++          result.successful = false;
++          result.reason = "RGB gain is unavailable on mono sensors";
++          return result;
++        }
+         r_gain_ = param.as_int();
+         int status = CameraSetGain(h_camera_, r_gain_, g_gain_, b_gain_);
+         if (status != CAMERA_STATUS_SUCCESS) {
+@@ -251,6 +478,11 @@
+           result.reason = "Failed to set RGB gain, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "rgb_gain.g") {
++        if (mono_sensor_) {
++          result.successful = false;
++          result.reason = "RGB gain is unavailable on mono sensors";
++          return result;
++        }
+         g_gain_ = param.as_int();
+         int status = CameraSetGain(h_camera_, r_gain_, g_gain_, b_gain_);
+         if (status != CAMERA_STATUS_SUCCESS) {
+@@ -258,6 +490,11 @@
+           result.reason = "Failed to set RGB gain, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "rgb_gain.b") {
++        if (mono_sensor_) {
++          result.successful = false;
++          result.reason = "RGB gain is unavailable on mono sensors";
++          return result;
++        }
+         b_gain_ = param.as_int();
+         int status = CameraSetGain(h_camera_, r_gain_, g_gain_, b_gain_);
+         if (status != CAMERA_STATUS_SUCCESS) {
+@@ -265,12 +502,22 @@
+           result.reason = "Failed to set RGB gain, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "saturation") {
++        if (mono_sensor_) {
++          result.successful = false;
++          result.reason = "Saturation is unavailable on mono sensors";
++          return result;
++        }
+         int status = CameraSetSaturation(h_camera_, param.as_int());
+         if (status != CAMERA_STATUS_SUCCESS) {
+           result.successful = false;
+           result.reason = "Failed to set saturation, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "gamma") {
++        if (!gamma_supported_) {
++          result.successful = false;
++          result.reason = "Gamma control is unavailable on this camera";
++          return result;
++        }
+         int gamma = param.as_int();
+         int status = CameraSetGamma(h_camera_, gamma);
+         if (status != CAMERA_STATUS_SUCCESS) {
+@@ -287,7 +534,12 @@
+     return result;
+   }
+ 
+-  int h_camera_;
++  int h_camera_ = -1;
++  bool camera_initialized_ = false;
++  bool mono_sensor_ = false;
++  bool gamma_supported_ = false;
++  std::string camera_serial_;
++  std::string camera_model_;
+   uint8_t * pby_buffer_;
+   tSdkCameraCapbility t_capability_;  // 设备描述信息
+   tSdkFrameHead s_frame_info_;        // 图像帧头信息
+@@ -297,7 +549,7 @@
+   image_transport::CameraPublisher camera_pub_; //
+ 
+   // RGB Gain
+-  int r_gain_, g_gain_, b_gain_;
++  int r_gain_ = 0, g_gain_ = 0, b_gain_ = 0;
+ 
+   bool flip_image_;
+ 
+--- a/config/camera_params.yaml
++++ b/config/camera_params.yaml
+@@ -1,6 +1,7 @@
+ /mv_camera:
+   ros__parameters:
+     camera_name: mv_camera
++    camera_serial: ""
+ 
+     exposure_time: 4000 
+     analog_gain: 8

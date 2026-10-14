@@ -103,22 +103,39 @@ load_env() {   # 载入 ROS + 该驱动工作空间环境
   [[ -n "$ros_setup" ]] || { err "找不到任何 ROS 2 环境（/opt/ros/*/setup.bash）"; return 1; }
   # shellcheck disable=SC1090
   source "$ros_setup"
+  local overlay sdk_exports
+  overlay="$(/usr/bin/python3 -s "$SCRIPT_DIR/driver_runtime.py" "$d" --setup)" || return 1
   if [[ -f "${WS[$d]}/install/setup.bash" ]]; then
     # shellcheck disable=SC1090
     source "${WS[$d]}/install/setup.bash"
-  else
-    err "还没编译：${WS[$d]}/install 不存在。先在该目录执行 colcon build"
+  elif [[ -z "$overlay" ]]; then
+    err "还没编译：请运行 /usr/bin/python3 -s $SCRIPT_DIR/build_camera_drivers.py $d"
     return 1
   fi
+  # 与 GUI 使用同一套修复驱动和 SDK，禁止命令行退回昨晚的旧库。
+  if [[ -n "$overlay" ]]; then
+    source "$overlay" || return 1
+    ok "使用兼容修复驱动: $overlay"
+  fi
+  sdk_exports="$(/usr/bin/python3 -s "$SCRIPT_DIR/driver_runtime.py" "$d" --shell)" || return 1
+  eval "$sdk_exports"
+
 }
 
-exe_path() { echo "${WS[$1]}/install/${PKG[$1]}/lib/${PKG[$1]}/${EXE[$1]}"; }
+exe_path() {
+  local overlay install
+  overlay="$(/usr/bin/python3 -s "$SCRIPT_DIR/driver_runtime.py" "$1" --setup)" || return 1
+  install="${WS[$1]}/install"
+  [[ -n "$overlay" ]] && install="$(dirname "$overlay")"
+  echo "$install/${PKG[$1]}/lib/${PKG[$1]}/${EXE[$1]}"
+}
 
 cmd_list() {
   local d
   for d in hik galaxy mv; do
     local st="未编译"
     [[ -f "${WS[$d]}/install/setup.bash" ]] && st="已编译"
+    [[ -f "$SCRIPT_DIR/.driver_runtime/$d/install/setup.bash" ]] && st="兼容版已编译"
     printf '%-8s %-22s %-24s %s\n     %s\n' \
       "$d" "${PKG[$d]}" "$(basename "${WS[$d]}")" "$st" "${WS[$d]}"
   done
@@ -143,7 +160,12 @@ cmd_check() {
   # 让后台作业自成进程组（$! 即组长），退出时杀整组；
   # 只杀 ros2 run 外壳会留下真正的节点进程变野节点。
   set -m
-  ros2 run "${PKG[$d]}" "${EXE[$d]}" >"$log" 2>&1 &
+  local driver_args=()
+  if [[ -f "$SCRIPT_DIR/.driver_runtime/$d/install/setup.bash" ]]; then
+    driver_args=(--ros-args -p "camera_info_url:=file://${WS[$d]}/${CFG[$d]}")
+    [[ -n "${CALIB_CAMERA_SERIAL:-}" ]] && driver_args+=(-p "camera_serial:=$CALIB_CAMERA_SERIAL")
+  fi
+  ros2 run "${PKG[$d]}" "${EXE[$d]}" "${driver_args[@]}" >"$log" 2>&1 &
   local cpid=$!
   set +m
   sleep 6
@@ -154,24 +176,26 @@ cmd_check() {
   local sdk_ok=0
   if grep -qE "camera count = [0-9]|device_count = [0-9]" "$log"; then
     sdk_ok=1
-    ok "SDK 加载成功、枚举正常（没插相机也能确认 SDK 本身是好的）"
+    ok "驱动进入枚举流程（还需找到设备并成功取图）"
   fi
-  if grep -qiE "GxIAPI failed|Init failed|初始化失败|MV_E_|dlopen|not found TL" "$log"; then
+  if grep -qiE "GxIAPI failed|Init failed|初始化失败|MV_E_|dlopen|not found TL|enumeration failed|Multiple cameras|No matching camera|conversion failed|Unsupported pixel format|\[FATAL\]" "$log"; then
     err "SDK 初始化失败，诊断如下："
     grep -iE "GxIAPI failed|Init failed|MV_E_|not found TL|Unable to open file" "$log" | head -3 | sed 's/^/    /'
     sdk_ok=0
   fi
   if (( sdk_ok )); then
-    if grep -qE "camera count = [1-9]" "$log"; then
+    if grep -qE "camera count = [1-9]|device_count = [1-9]|CALIB_SELECTED_CAMERA" "$log"; then
       ok "检测到相机，可以直接标定：$0 run $d"
     else
-      warn "没有检测到相机（插上相机、确认供电与 USB3 口）"
+      warn "没有检测到相机：检查 SDK 版本、权限、供电、USB3 或 GigE 网段"
+      sdk_ok=0
     fi
   elif ! grep -qiE "GxIAPI failed|Init failed" "$log"; then
     warn "输出不符合预期，原始日志："
     head -5 "$log" | sed 's/^/    /'
   fi
   rm -f "$log"
+  (( sdk_ok ))
 }
 
 pick_image_topic() {   # 轮询等待相机节点发布图像话题，打印话题名
@@ -223,7 +247,12 @@ cmd_run() {
   if (( start_driver )); then
     say "→ 后台启动 ${PKG[$d]} ..."
     set -m
-    ros2 run "${PKG[$d]}" "${EXE[$d]}" > "$sess/驱动日志.log" 2>&1 &
+    local driver_args=()
+    if [[ -f "$SCRIPT_DIR/.driver_runtime/$d/install/setup.bash" ]]; then
+      driver_args=(--ros-args -p "camera_info_url:=file://${WS[$d]}/${CFG[$d]}")
+      [[ -n "${CALIB_CAMERA_SERIAL:-}" ]] && driver_args+=(-p "camera_serial:=$CALIB_CAMERA_SERIAL")
+    fi
+    ros2 run "${PKG[$d]}" "${EXE[$d]}" "${driver_args[@]}" > "$sess/驱动日志.log" 2>&1 &
     drv_pid=$!
     set +m
     say "→ 等待图像话题（日志 $sess/驱动日志.log）..."

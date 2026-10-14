@@ -19,3 +19,6 @@ venv/
 .idea/
 *.swp
 .DS_Store
+
+# 独立编译的厂商驱动和 SDK（源码补丁在 driver_patches 中）
+.driver_runtime/

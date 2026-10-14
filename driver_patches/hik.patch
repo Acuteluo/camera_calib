@@ -1,0 +1,279 @@
+--- a/src/hik_camera_node.cpp
++++ b/src/hik_camera_node.cpp
+@@ -1,4 +1,6 @@
+ #include "MvCameraControl.h"
++#include <cstring>
++#include <stdexcept>
+ // ROS
+ #include <camera_info_manager/camera_info_manager.hpp>
+ #include <image_transport/image_transport.hpp>
+@@ -17,37 +19,92 @@
+   {
+     RCLCPP_INFO(this->get_logger(), "Starting HikCameraNode!");
+ 
+-    MV_CC_DEVICE_INFO_LIST device_list;
+-    // enum device
+-    nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+-    RCLCPP_INFO(this->get_logger(), "Found camera count = %d", device_list.nDeviceNum);
+-
+-    while (device_list.nDeviceNum == 0 && rclcpp::ok()) {
+-      RCLCPP_ERROR(this->get_logger(), "No camera found!");
+-      RCLCPP_INFO(this->get_logger(), "Enum state: [%x]", nRet);
+-      std::this_thread::sleep_for(std::chrono::seconds(1));
+-      nRet = MV_CC_EnumDevices(MV_USB_DEVICE, &device_list);
+-    }
+-
+-    MV_CC_CreateHandle(&camera_handle_, device_list.pDeviceInfo[0]);
+-
+-    MV_CC_OpenDevice(camera_handle_);
+-
+-    // Get camera infomation
+-    MV_CC_GetImageInfo(camera_handle_, &img_info_);
+-    image_msg_.data.reserve(img_info_.nHeightMax * img_info_.nWidthMax * 3);
+-
+-    // Init convert param
+-    convert_param_.nWidth = img_info_.nWidthValue;
+-    convert_param_.nHeight = img_info_.nHeightValue;
++    // USB 与 GigE 共用厂商枚举；单台自动选择，多台必须指定序列号。
++    RCLCPP_INFO(this->get_logger(), "MVS SDK version: 0x%08x", MV_CC_GetSDKVersion());
++    const auto serial = this->declare_parameter<std::string>("camera_serial", "");
++    MV_CC_DEVICE_INFO_LIST device_list{};
++    nRet = MV_CC_EnumDevices(MV_USB_DEVICE | MV_GIGE_DEVICE, &device_list);
++    if (nRet != MV_OK) {
++      throw std::runtime_error("MVS enumeration failed: " + std::to_string(nRet));
++    }
++    RCLCPP_INFO(this->get_logger(), "Found camera count = %u", device_list.nDeviceNum);
++    MV_CC_DEVICE_INFO * selected = nullptr;
++    unsigned int matches = 0;
++    for (unsigned int i = 0; i < device_list.nDeviceNum; ++i) {
++      auto * info = device_list.pDeviceInfo[i];
++      const unsigned char * sn = nullptr;
++      const unsigned char * model = nullptr;
++      size_t sn_size = 0;
++      if (info->nTLayerType == MV_USB_DEVICE) {
++        sn = info->SpecialInfo.stUsb3VInfo.chSerialNumber;
++        sn_size = sizeof(info->SpecialInfo.stUsb3VInfo.chSerialNumber);
++        model = info->SpecialInfo.stUsb3VInfo.chModelName;
++      } else if (info->nTLayerType == MV_GIGE_DEVICE) {
++        sn = info->SpecialInfo.stGigEInfo.chSerialNumber;
++        sn_size = sizeof(info->SpecialInfo.stGigEInfo.chSerialNumber);
++        model = info->SpecialInfo.stGigEInfo.chModelName;
++      } else {
++        continue;
++      }
++      const std::string device_serial(reinterpret_cast<const char *>(sn),
++        strnlen(reinterpret_cast<const char *>(sn), sn_size));
++      RCLCPP_INFO(this->get_logger(), "Camera model=%s serial=%s interface=%s",
++        reinterpret_cast<const char *>(model), device_serial.c_str(),
++        info->nTLayerType == MV_USB_DEVICE ? "USB" : "GigE");
++      if (serial.empty() || serial == device_serial) {
++        selected = info;
++        ++matches;
++      }
++    }
++    if (matches != 1) {
++      throw std::runtime_error(matches == 0 ?
++        "No matching camera; check SDK, cable, permissions and GigE subnet" :
++        "Multiple cameras; set camera_serial to select exactly one");
++    }
++    const auto * selected_sn = selected->nTLayerType == MV_USB_DEVICE ?
++      selected->SpecialInfo.stUsb3VInfo.chSerialNumber : selected->SpecialInfo.stGigEInfo.chSerialNumber;
++    const auto * selected_model = selected->nTLayerType == MV_USB_DEVICE ?
++      selected->SpecialInfo.stUsb3VInfo.chModelName : selected->SpecialInfo.stGigEInfo.chModelName;
++    auto require_ok = [this](int status, const char * operation) {
++      if (status == MV_OK) return;
++      if (camera_handle_) {
++        MV_CC_CloseDevice(camera_handle_);
++        MV_CC_DestroyHandle(camera_handle_);
++        camera_handle_ = nullptr;
++      }
++      throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(status));
++    };
++    require_ok(MV_CC_CreateHandle(&camera_handle_, selected), "CreateHandle");
++    require_ok(MV_CC_OpenDevice(camera_handle_), "OpenDevice");
++    RCLCPP_INFO(this->get_logger(), "CALIB_SELECTED_CAMERA serial=%s transport=%s model=%s",
++      reinterpret_cast<const char *>(selected_sn),
++      selected->nTLayerType == MV_USB_DEVICE ? "USB" : "GigE",
++      reinterpret_cast<const char *>(selected_model));
++    if (selected->nTLayerType == MV_GIGE_DEVICE) {
++      const int packet_size = MV_CC_GetOptimalPacketSize(camera_handle_);
++      if (packet_size > 0) {
++        require_ok(MV_CC_SetIntValue(camera_handle_, "GevSCPSPacketSize", packet_size),
++          "Set GigE packet size");
++      }
++    }
++    // 标定需要连续画面，避免相机保留外触发设置后一直等不到图像。
++    require_ok(MV_CC_SetEnumValue(camera_handle_, "TriggerMode", 0), "Disable trigger");
+     convert_param_.enDstPixelType = PixelType_Gvsp_RGB8_Packed;
+     bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", false);
+     auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+     camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
+ 
+-    declareParameters();
+-
+-    MV_CC_StartGrabbing(camera_handle_);
++    // 关闭自动曝光/增益；不支持该可选节点时保留 SDK 原状态。
++    MV_CC_SetEnumValue(camera_handle_, "ExposureAuto", 0);
++    MV_CC_SetEnumValue(camera_handle_, "GainAuto", 0);
++    try { declareParameters(); } catch (...) {
++      MV_CC_CloseDevice(camera_handle_);
++      MV_CC_DestroyHandle(camera_handle_);
++      camera_handle_ = nullptr;
++      throw;
++    }
++
++    require_ok(MV_CC_StartGrabbing(camera_handle_), "StartGrabbing");
+     MV_CC_SetBayerCvtQuality(camera_handle_, 1);
+     // MV_CC_SetSharpness(camera_handle_,999999);
+     // Load camera info
+@@ -67,7 +124,7 @@
+       std::bind(&HikCameraNode::parametersCallback, this, std::placeholders::_1));
+ 
+     capture_thread_ = std::thread{[this]() -> void {
+-      MV_FRAME_OUT out_frame;
++      MV_FRAME_OUT out_frame{};
+ 
+       RCLCPP_INFO(this->get_logger(), "Publishing image!");
+ 
+@@ -77,22 +134,26 @@
+       while (rclcpp::ok()) {
+         nRet = MV_CC_GetImageBuffer(camera_handle_, &out_frame, 1000);
+         if (MV_OK == nRet) {
++          // 必须在转换前分配当前帧的容量；不同型号/ROI 的尺寸由帧头决定。
++          image_msg_.height = out_frame.stFrameInfo.nHeight;
++          image_msg_.width = out_frame.stFrameInfo.nWidth;
++          image_msg_.step = image_msg_.width * 3;
++          image_msg_.data.resize(static_cast<size_t>(image_msg_.step) * image_msg_.height);
++          convert_param_.nWidth = image_msg_.width;
++          convert_param_.nHeight = image_msg_.height;
+           convert_param_.pDstBuffer = image_msg_.data.data();
+           convert_param_.nDstBufferSize = image_msg_.data.size();
+           convert_param_.pSrcData = out_frame.pBufAddr;
+           convert_param_.nSrcDataLen = out_frame.stFrameInfo.nFrameLen;
+           convert_param_.enSrcPixelType = out_frame.stFrameInfo.enPixelType;
+-
+-          MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
+-          
+-          //flip_vertically(image_msg_.data.data(), out_frame.stFrameInfo.nWidth, out_frame.stFrameInfo.nHeight, out_frame.stFrameInfo.nWidth * 3);
+-          //flip_horizontally(image_msg_.data.data(), out_frame.stFrameInfo.nWidth, out_frame.stFrameInfo.nHeight, out_frame.stFrameInfo.nWidth * 3);
+-
++          const int conversion = MV_CC_ConvertPixelType(camera_handle_, &convert_param_);
++          if (conversion != MV_OK) {
++            MV_CC_FreeImageBuffer(camera_handle_, &out_frame);
++            RCLCPP_ERROR(this->get_logger(), "Unsupported pixel format / conversion failed: 0x%x", conversion);
++            rclcpp::shutdown();
++            break;
++          }
+           image_msg_.header.stamp = this->now();
+-          image_msg_.height = out_frame.stFrameInfo.nHeight;
+-          image_msg_.width = out_frame.stFrameInfo.nWidth;
+-          image_msg_.step = out_frame.stFrameInfo.nWidth * 3;
+-          image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+ 
+           camera_info_msg_.header = image_msg_.header;
+           camera_pub_.publish(image_msg_, camera_info_msg_);
+@@ -131,21 +192,25 @@
+   void declareParameters()
+   {
+     rcl_interfaces::msg::ParameterDescriptor param_desc;
+-    MVCC_FLOATVALUE f_value;
++    MVCC_FLOATVALUE f_value{};
+     param_desc.integer_range.resize(1);
+     param_desc.integer_range[0].step = 1;
+     // Exposure time
+     param_desc.description = "Exposure time in microseconds";
+-    MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value);
++    if (MV_CC_GetFloatValue(camera_handle_, "ExposureTime", &f_value) != MV_OK) {
++      throw std::runtime_error("Camera has no readable ExposureTime node");
++    }
+     param_desc.integer_range[0].from_value = f_value.fMin;
+     param_desc.integer_range[0].to_value = f_value.fMax;
+-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
++    double exposure_time = this->declare_parameter("exposure_time", static_cast<int>(f_value.fCurValue), param_desc);
+     MV_CC_SetFloatValue(camera_handle_, "ExposureTime", exposure_time);
+     RCLCPP_INFO(this->get_logger(), "Exposure time: %f", exposure_time);
+ 
+     // Gain
+     param_desc.description = "Gain";
+-    MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value);
++    if (MV_CC_GetFloatValue(camera_handle_, "Gain", &f_value) != MV_OK) {
++      throw std::runtime_error("Camera has no readable Gain node");
++    }
+     param_desc.integer_range[0].from_value = f_value.fMin;
+     param_desc.integer_range[0].to_value = f_value.fMax;
+     double gain = this->declare_parameter("gain", f_value.fCurValue, param_desc);
+@@ -224,10 +289,10 @@
+   image_transport::CameraPublisher camera_pub_;
+ 
+   int nRet = MV_OK;
+-  void * camera_handle_;
++  void * camera_handle_ = nullptr;
+   MV_IMAGE_BASIC_INFO img_info_;
+ 
+-  MV_CC_PIXEL_CONVERT_PARAM convert_param_;
++  MV_CC_PIXEL_CONVERT_PARAM convert_param_{};
+ 
+   std::string camera_name_;
+   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,31 +19,36 @@
+   src/hik_camera_node.cpp
+ )
+ 
+-target_include_directories(${PROJECT_NAME} PUBLIC hikSDK/include)
+-
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC hikSDK/lib/amd64)
+-  install(
+-    DIRECTORY hikSDK/lib/amd64/
+-    DESTINATION lib
+-  )
+-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC hikSDK/lib/arm64)
+-  install(
+-    DIRECTORY hikSDK/lib/arm64/
+-    DESTINATION lib
+-  )
++# 编译头文件和运行库必须来自同一套 SDK，禁止新旧版本混用。
++set(HIK_SDK_ROOT "$ENV{HIK_SDK_ROOT}" CACHE PATH "MVS SDK root")
++if(NOT HIK_SDK_ROOT)
++  if(EXISTS "/opt/MVS/include/MvCameraControl.h")
++    set(HIK_SDK_ROOT "/opt/MVS")
++  else()
++    set(HIK_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/hikSDK")
++  endif()
++endif()
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
++  set(SDK_ARCH amd64)
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
++  set(SDK_ARCH arm64)
+ else()
+-  message(FATAL_ERROR "Unsupport host system architecture: ${CMAKE_HOST_SYSTEM_PROCESSOR}!")
++  message(FATAL_ERROR "Unsupported architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
+-
+-target_link_libraries(${PROJECT_NAME}
+-  FormatConversion
+-  MediaProcess
+-  MvCameraControl
+-  MVRender
+-  MvUsb3vTL
+-)
++if(EXISTS "${HIK_SDK_ROOT}/lib/${SDK_ARCH}/libMvCameraControl.so")
++  set(SDK_LIB "${HIK_SDK_ROOT}/lib/${SDK_ARCH}")
++else()
++  set(SDK_LIB "${HIK_SDK_ROOT}/lib/64")
++endif()
++if(NOT EXISTS "${HIK_SDK_ROOT}/include/MvCameraControl.h" OR
++   NOT EXISTS "${SDK_LIB}/libMvCameraControl.so")
++  message(FATAL_ERROR "Incomplete MVS SDK: ${HIK_SDK_ROOT}")
++endif()
++message(STATUS "MVS SDK headers=${HIK_SDK_ROOT}/include libraries=${SDK_LIB}")
++target_include_directories(${PROJECT_NAME} PUBLIC "${HIK_SDK_ROOT}/include")
++target_link_libraries(${PROJECT_NAME} "${SDK_LIB}/libMvCameraControl.so")
++# 传输层与图像转换库也来自同一版本，SDK 会在运行时载入它们。
++install(DIRECTORY "${SDK_LIB}/" DESTINATION lib)
+ 
+ rclcpp_components_register_node(${PROJECT_NAME}
+   PLUGIN hik_camera::HikCameraNode

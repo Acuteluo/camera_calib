@@ -1,0 +1,682 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -19,23 +19,31 @@
+   src/galaxy_camera_node.cpp
+ )
+ 
+-target_include_directories(${PROJECT_NAME} PUBLIC GalaxySDK/include)
++set(GALAXY_SDK_ROOT "$ENV{GALAXY_SDK_ROOT}" CACHE PATH
++  "Root directory of the Galaxy SDK (defaults to the bundled SDK)")
++if(NOT GALAXY_SDK_ROOT)
++  set(GALAXY_SDK_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/GalaxySDK")
++endif()
++
++if(NOT EXISTS "${GALAXY_SDK_ROOT}/include/GxIAPI.h" OR
++   NOT EXISTS "${GALAXY_SDK_ROOT}/include/DxImageProc.h")
++  message(FATAL_ERROR "Galaxy SDK headers not found under ${GALAXY_SDK_ROOT}")
++endif()
++target_include_directories(${PROJECT_NAME} PUBLIC "${GALAXY_SDK_ROOT}/include")
+ 
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC GalaxySDK/lib/amd64)
+-  install(
+-    DIRECTORY GalaxySDK/lib/amd64/
+-    DESTINATION lib
+-  )
++  set(GALAXY_SDK_LIB_DIR "${GALAXY_SDK_ROOT}/lib/amd64")
+ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+-  target_link_directories(${PROJECT_NAME} PUBLIC GalaxySDK/lib/arm64)
+-  install(
+-    DIRECTORY GalaxySDK/lib/arm64/
+-    DESTINATION lib
+-  )
++  set(GALAXY_SDK_LIB_DIR "${GALAXY_SDK_ROOT}/lib/arm64")
+ else()
+-  message(FATAL_ERROR "Unsupport host system architecture: ${CMAKE_HOST_SYSTEM_PROCESSOR}!")
++  message(FATAL_ERROR "Unsupported target architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+ endif()
++if(NOT EXISTS "${GALAXY_SDK_LIB_DIR}/libgxiapi.so")
++  message(FATAL_ERROR "Galaxy SDK library not found: ${GALAXY_SDK_LIB_DIR}/libgxiapi.so")
++endif()
++target_link_directories(${PROJECT_NAME} PUBLIC "${GALAXY_SDK_LIB_DIR}")
++# 把选定 SDK 的运行库装入 overlay，避免加载系统中另一版本的同名库。
++install(DIRECTORY "${GALAXY_SDK_LIB_DIR}/" DESTINATION lib)
+ 
+ target_link_libraries(${PROJECT_NAME}
+   gxiapi
+--- a/src/galaxy_camera_node.cpp
++++ b/src/galaxy_camera_node.cpp
+@@ -1,7 +1,13 @@
+ #include "GxIAPI.h"
+ #include "DxImageProc.h"
+-#include <condition_variable>
+-#include <mutex>
++#include <chrono>
++#include <cmath>
++#include <cstring>
++#include <cstdio>
++#include <string>
++#include <stdexcept>
++#include <thread>
++#include <vector>
+ // ROS
+ #include <camera_info_manager/camera_info_manager.hpp>
+ #include <image_transport/image_transport.hpp>
+@@ -23,59 +29,153 @@
+     GX_STATUS status;
+     RCLCPP_INFO(this->get_logger(), "Starting GalaxyCameraNode!");
+ 
+-    // Init lib
+-    do {
+-      status = GXInitLib();
+-      if (!GX_SUCCESS(status)) {
+-        RCLCPP_FATAL(this->get_logger(), "Init GxIAPI failed, code = %x!", status);
+-        exit(status);
+-        std::this_thread::sleep_for(std::chrono::seconds(1));
+-      }
+-    } while (!GX_SUCCESS(status));
+-
+-    // Constantly try opening one camera
+-    while (true) {
++    const std::string requested_serial = this->declare_parameter<std::string>("camera_serial", "");
++    status = GXInitLib();
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_FATAL(this->get_logger(), "Init GxIAPI failed, code = %x", status);
++      rclcpp::shutdown();
++      return;
++    }
++    sdk_initialized_ = true;
++
++    // GigE 设备使用全网段枚举；短暂重试后退出，避免启动脚本误把持续等待当作健康。
++    constexpr int kMaxDiscoveryAttempts = 3;
++    int discovery_attempts = 0;
++    while (rclcpp::ok() && discovery_attempts < kMaxDiscoveryAttempts) {
+       uint32_t device_count = 0;
+-      status = GXUpdateDeviceList(&device_count, 100);
+-      if (device_count < 1) {
+-        RCLCPP_WARN(this->get_logger(), "No camera found. device_count = %d", device_count);
++      status = GXUpdateAllDeviceList(&device_count, 100);
++      if (!GX_SUCCESS(status) || device_count < 1) {
++        RCLCPP_WARN(this->get_logger(), "No camera found or enumeration failed (status=%d, count=%u)",
++          status, device_count);
++        ++discovery_attempts;
++        if (discovery_attempts >= kMaxDiscoveryAttempts) {
++          RCLCPP_FATAL(this->get_logger(), "No camera found after %d attempts", discovery_attempts);
++          rclcpp::shutdown();
++          return;
++        }
+         std::this_thread::sleep_for(std::chrono::seconds(1));
+         continue;
+       }
+-      status = GXOpenDeviceByIndex(1, &camera_handle_);
++
++      std::vector<GX_DEVICE_BASE_INFO> devices(device_count);
++      size_t device_info_size = devices.size() * sizeof(GX_DEVICE_BASE_INFO);
++      status = GXGetAllDeviceBaseInfo(devices.data(), &device_info_size);
+       if (!GX_SUCCESS(status)) {
+-        RCLCPP_ERROR(this->get_logger(), "Can not open camera, status = %d", status);
++        RCLCPP_ERROR(this->get_logger(), "Cannot read camera identity, status = %d", status);
++        rclcpp::shutdown();
++        return;
++      }
++      if (device_info_size % sizeof(GX_DEVICE_BASE_INFO) != 0 ||
++          device_info_size / sizeof(GX_DEVICE_BASE_INFO) != device_count) {
++        RCLCPP_ERROR(this->get_logger(), "Galaxy SDK returned an inconsistent device list");
++        rclcpp::shutdown();
++        return;
++      }
++
++      size_t selected_index = 0;
++      size_t match_count = 0;
++      for (size_t i = 0; i < devices.size(); ++i) {
++        const std::string serial(devices[i].szSN,
++          strnlen(devices[i].szSN, sizeof(devices[i].szSN)));
++        const std::string model(devices[i].szModelName,
++          strnlen(devices[i].szModelName, sizeof(devices[i].szModelName)));
++        if (requested_serial.empty() || serial == requested_serial) {
++          selected_index = i;
++          ++match_count;
++        }
++        RCLCPP_INFO(this->get_logger(), "Camera candidate model=%s serial=%s", model.c_str(),
++          serial.empty() ? "unknown" : serial.c_str());
++      }
++      if (match_count != 1) {
++        if (match_count == 0) {
++          RCLCPP_FATAL(this->get_logger(), "No camera matches camera_serial='%s'", requested_serial.c_str());
++        } else {
++          RCLCPP_FATAL(this->get_logger(),
++            "Multiple cameras found; set camera_serial to select exactly one");
++        }
++        rclcpp::shutdown();
++        return;
++      }
++
++      char open_content[GX_INFO_LENGTH_32_BYTE] = {};
++      GX_OPEN_PARAM open_param{};
++      const std::string selected_serial(devices[selected_index].szSN,
++        strnlen(devices[selected_index].szSN, sizeof(devices[selected_index].szSN)));
++      if (!selected_serial.empty()) {
++        std::snprintf(open_content, sizeof(open_content), "%s", selected_serial.c_str());
++        open_param.openMode = GX_OPEN_SN;
++      } else if (device_count == 1) {
++        // 单台设备的旧型号若不提供 SN，只能用 SDK 的单设备索引回退。
++        std::snprintf(open_content, sizeof(open_content), "1");
++        open_param.openMode = GX_OPEN_INDEX;
+       } else {
+-        break;
+-      }
+-    };
+-
+-    // Get camera infomation
+-    GXGetInt(camera_handle_, GX_INT_WIDTH, &img_info_.nWidthValue);
+-    GXGetInt(camera_handle_, GX_INT_WIDTH_MAX, &img_info_.nWidthMax);
+-    GXGetInt(camera_handle_, GX_INT_HEIGHT, &img_info_.nHeightValue);
+-    GXGetInt(camera_handle_, GX_INT_HEIGHT_MAX, &img_info_.nHeightMax);
+-    image_msg_.data.reserve(img_info_.nHeightMax * img_info_.nWidthMax * 3);
+-
+-    // std::cout<<"======="<<img_info_.nWidthValue<<std::endl;
+-    // std::cout<<"======="<<img_info_.nHeightValue<<std::endl;
+-
+-
+-
+-    bool use_sensor_data_qos = this->declare_parameter("use_sensor_data_qos", true);
++        RCLCPP_FATAL(this->get_logger(), "Selected camera has no serial number; cannot disambiguate it");
++        rclcpp::shutdown();
++        return;
++      }
++      open_param.pszContent = open_content;
++      open_param.accessMode = GX_ACCESS_EXCLUSIVE;
++      status = GXOpenDevice(&open_param, &camera_handle_);
++      if (!GX_SUCCESS(status)) {
++        RCLCPP_ERROR(this->get_logger(), "Cannot open selected camera, status = %d", status);
++        ++discovery_attempts;
++        if (discovery_attempts >= kMaxDiscoveryAttempts) {
++          RCLCPP_FATAL(this->get_logger(), "Cannot open selected camera after %d attempts",
++            discovery_attempts);
++          rclcpp::shutdown();
++          return;
++        }
++        std::this_thread::sleep_for(std::chrono::seconds(1));
++        continue;
++      }
++      camera_open_ = true;
++      camera_serial_ = selected_serial.empty() ? "unknown" : selected_serial;
++      camera_model_ = std::string(devices[selected_index].szModelName,
++        strnlen(devices[selected_index].szModelName, sizeof(devices[selected_index].szModelName)));
++      const auto device_class = devices[selected_index].deviceClass;
++      const char * transport = device_class == GX_DEVICE_CLASS_GEV ? "GigE" :
++        (device_class == GX_DEVICE_CLASS_USB2 || device_class == GX_DEVICE_CLASS_U3V ? "USB" : "unknown");
++      RCLCPP_INFO(this->get_logger(), "CALIB_SELECTED_CAMERA serial=%s transport=%s model=%s",
++        camera_serial_.c_str(), transport, camera_model_.c_str());
++      break;
++    }
++    if (!camera_open_) {
++      rclcpp::shutdown();
++      return;
++    }
++
++    if (!selectPixelFormat() ||
++        !configureEnumFeature(GX_ENUM_ACQUISITION_MODE, "AcquisitionMode", GX_ACQ_MODE_CONTINUOUS) ||
++        !configureEnumFeature(GX_ENUM_TRIGGER_MODE, "TriggerMode", GX_TRIGGER_MODE_OFF)) {
++      rclcpp::shutdown();
++      return;
++    }
++
++    bool use_sensor_data_qos = declareCameraParameter<bool>("use_sensor_data_qos", true);
+     auto qos = use_sensor_data_qos ? rmw_qos_profile_sensor_data : rmw_qos_profile_default;
+     camera_pub_ = image_transport::create_camera_publisher(this, "image_raw", qos);
+ 
+-    declareParameters();
+-
+-    GXSendCommand(camera_handle_, GX_COMMAND_ACQUISITION_START);
++    try {
++      declareParameters();
++    } catch (...) {
++      cleanupCameraResources();
++      throw;
++    }
++
++    status = GXSendCommand(camera_handle_, GX_COMMAND_ACQUISITION_START);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_FATAL(this->get_logger(), "Cannot start camera acquisition, status = %d", status);
++      rclcpp::shutdown();
++      return;
++    }
++    acquisition_started_ = true;
+ 
+     // Load camera info
+-    camera_name_ = this->declare_parameter("camera_name", "narrow_stereo");
++    camera_name_ = declareCameraParameter<std::string>("camera_name", "narrow_stereo");
+     camera_info_manager_ =
+       std::make_unique<camera_info_manager::CameraInfoManager>(this, camera_name_);
+-    auto camera_info_url =
+-      this->declare_parameter("camera_info_url", "package://galaxy_camera/config/camera_info.yaml");
++    auto camera_info_url = declareCameraParameter<std::string>(
++      "camera_info_url", "package://galaxy_camera/config/camera_info.yaml");
+     if (camera_info_manager_->validateURL(camera_info_url)) {
+       camera_info_manager_->loadCameraInfo(camera_info_url);
+       camera_info_msg_ = camera_info_manager_->getCameraInfo();
+@@ -92,9 +192,15 @@
+       std::vector<char> bayer_buffer_holder;
+ 
+       // Initialize frame
+-      int64_t payloadSize;
+-      GXGetInt(camera_handle_, GX_INT_PAYLOAD_SIZE, &payloadSize);
+-      bayer_buffer_holder.reserve(payloadSize);
++      int64_t payloadSize = 0;
++      status = GXGetInt(camera_handle_, GX_INT_PAYLOAD_SIZE, &payloadSize);
++      if (!GX_SUCCESS(status) || payloadSize <= 0) {
++        RCLCPP_FATAL(this->get_logger(), "Invalid image payload size (status=%d, size=%ld)",
++          status, static_cast<long>(payloadSize));
++        rclcpp::shutdown();
++        return;
++      }
++      bayer_buffer_holder.resize(static_cast<size_t>(payloadSize));
+       bayer_frame.pImgBuf = bayer_buffer_holder.data();
+ 
+       RCLCPP_INFO(this->get_logger(), "Publishing image!");
+@@ -107,31 +213,70 @@
+         status = GXGetImage(camera_handle_, &bayer_frame, 500);
+         
+         if (GX_SUCCESS(status)) {
+-          DX_PIXEL_COLOR_FILTER bayer_type;
+-          switch (bayer_frame.nPixelFormat) {
+-          	case GX_PIXEL_FORMAT_BAYER_GR8: bayer_type = BAYERGR; break;
+-            case GX_PIXEL_FORMAT_BAYER_RG8: bayer_type = BAYERRG; break;
+-            case GX_PIXEL_FORMAT_BAYER_GB8: bayer_type = BAYERGB; break;
+-            case GX_PIXEL_FORMAT_BAYER_BG8: bayer_type = BAYERBG; break;
+-            default: RCLCPP_FATAL(this->get_logger(), "Unsupported Bayer layout: %d!", bayer_frame.nPixelFormat); return;
++          if (bayer_frame.nWidth <= 0 || bayer_frame.nHeight <= 0 || bayer_frame.nImgSize <= 0 ||
++              bayer_frame.pImgBuf == nullptr) {
++            RCLCPP_FATAL(this->get_logger(), "Invalid image frame dimensions or buffer (%dx%d, bytes=%d)",
++              bayer_frame.nWidth, bayer_frame.nHeight, bayer_frame.nImgSize);
++            rclcpp::shutdown();
++            break;
+           }
+-
++          if (bayer_frame.nPixelFormat != selected_pixel_format_) {
++            RCLCPP_FATAL(this->get_logger(),
++              "Frame PixelFormat changed unexpectedly (selected=%ld, received=%d)",
++              static_cast<long>(selected_pixel_format_), bayer_frame.nPixelFormat);
++            rclcpp::shutdown();
++            break;
++          }
++          const size_t width = bayer_frame.nWidth;
++          const size_t height = bayer_frame.nHeight;
++          const size_t pixels = width * height;
++          if (static_cast<size_t>(bayer_frame.nImgSize) < pixels) {
++            RCLCPP_FATAL(this->get_logger(), "Invalid or truncated image frame (%dx%d, bytes=%d)",
++              bayer_frame.nWidth, bayer_frame.nHeight, bayer_frame.nImgSize);
++            rclcpp::shutdown();
++            break;
++          }
+           image_msg_.header.stamp = this->now();
+-          image_msg_.height = bayer_frame.nHeight;
+-          image_msg_.width = bayer_frame.nWidth;
+-          image_msg_.step = bayer_frame.nWidth * 3;
+-          image_msg_.data.resize(image_msg_.width * image_msg_.height * 3);
+-
+-    // std::cout<<"???????????????"<<image_msg_.width<<std::endl;
+-    // std::cout<<"?????????????"<<image_msg_.height<<std::endl;
+-
+-          status = DxRaw8toRGB24(bayer_frame.pImgBuf, image_msg_.data.data(),
+-                                 bayer_frame.nWidth, bayer_frame.nHeight,
+-                                 RAW2RGB_NEIGHBOUR, bayer_type, false);
+-
+-          if (!GX_SUCCESS(status)) {
+-            RCLCPP_ERROR(this->get_logger(), "Failed to convert Bayer to RGB, status = %d", status);
+-            continue;
++          image_msg_.height = static_cast<uint32_t>(height);
++          image_msg_.width = static_cast<uint32_t>(width);
++          image_msg_.step = static_cast<uint32_t>(width * 3);
++          image_msg_.data.resize(pixels * 3);
++
++          if (bayer_frame.nPixelFormat == GX_PIXEL_FORMAT_MONO8) {
++            // ROS 节点统一发布 rgb8；Mono8 像素按 RGB 三通道复制，不做伪彩色处理。
++            const auto * mono = static_cast<const uint8_t *>(bayer_frame.pImgBuf);
++            for (size_t i = 0; i < pixels; ++i) {
++              image_msg_.data[3 * i] = mono[i];
++              image_msg_.data[3 * i + 1] = mono[i];
++              image_msg_.data[3 * i + 2] = mono[i];
++            }
++          } else {
++            DX_PIXEL_COLOR_FILTER bayer_type = BAYERGR;
++            bool supported_format = true;
++            switch (bayer_frame.nPixelFormat) {
++              case GX_PIXEL_FORMAT_BAYER_GR8: bayer_type = BAYERGR; break;
++              case GX_PIXEL_FORMAT_BAYER_RG8: bayer_type = BAYERRG; break;
++              case GX_PIXEL_FORMAT_BAYER_GB8: bayer_type = BAYERGB; break;
++              case GX_PIXEL_FORMAT_BAYER_BG8: bayer_type = BAYERBG; break;
++              default:
++                RCLCPP_FATAL(this->get_logger(),
++                  "Unsupported pixel format %d: only Mono8 and 8-bit Bayer are supported; "
++                  "10/12-bit SDK unpack/debayer conversion is not configured",
++                  bayer_frame.nPixelFormat);
++                supported_format = false;
++                rclcpp::shutdown();
++                break;
++            }
++            if (!supported_format) {
++              break;
++            }
++            status = DxRaw8toRGB24(bayer_frame.pImgBuf, image_msg_.data.data(),
++              bayer_frame.nWidth, bayer_frame.nHeight,
++              RAW2RGB_NEIGHBOUR, bayer_type, false);
++            if (!GX_SUCCESS(status)) {
++              RCLCPP_ERROR(this->get_logger(), "Failed to convert Bayer to RGB, status = %d", status);
++              continue;
++            }
+           }
+ 
+           RCLCPP_DEBUG(this->get_logger(), "Publish image: %dx%d", bayer_frame.nWidth, bayer_frame.nHeight);
+@@ -162,40 +307,242 @@
+     if (capture_thread_.joinable()) {
+       capture_thread_.join();
+     }
+-    if (camera_handle_) {
+-      GXSendCommand(camera_handle_, GX_COMMAND_ACQUISITION_STOP);
++    cleanupCameraResources();
++    RCLCPP_INFO(this->get_logger(), "GalaxyCameraNode destroyed!");
++  }
++
++private:
++  void cleanupCameraResources() noexcept
++  {
++    if (camera_open_) {
++      if (acquisition_started_) {
++        GXSendCommand(camera_handle_, GX_COMMAND_ACQUISITION_STOP);
++        acquisition_started_ = false;
++      }
+       GXCloseDevice(camera_handle_);
+-    }
+-    GXCloseLib();
+-    RCLCPP_INFO(this->get_logger(), "GalaxyCameraNode destroyed!");
+-  }
+-
+-private:
++      camera_open_ = false;
++      camera_handle_ = nullptr;
++    }
++    if (sdk_initialized_) {
++      GXCloseLib();
++      sdk_initialized_ = false;
++    }
++  }
++
++  template<typename T>
++  T declareCameraParameter(
++    const std::string & name, const T & default_value,
++    const rcl_interfaces::msg::ParameterDescriptor * descriptor = nullptr)
++  {
++    try {
++      if (descriptor != nullptr) {
++        return this->declare_parameter<T>(name, default_value, *descriptor);
++      }
++      return this->declare_parameter<T>(name, default_value);
++    } catch (...) {
++      cleanupCameraResources();
++      throw;
++    }
++  }
++
++  bool selectPixelFormat()
++  {
++    uint32_t entry_count = 0;
++    GX_STATUS status = GXGetEnumEntryNums(camera_handle_, GX_ENUM_PIXEL_FORMAT, &entry_count);
++    if (!GX_SUCCESS(status) || entry_count == 0) {
++      RCLCPP_FATAL(this->get_logger(), "Cannot enumerate supported PixelFormat values (status=%d)", status);
++      return false;
++    }
++
++    std::vector<GX_ENUM_DESCRIPTION> entries(entry_count);
++    size_t buffer_size = entries.size() * sizeof(GX_ENUM_DESCRIPTION);
++    status = GXGetEnumDescription(camera_handle_, GX_ENUM_PIXEL_FORMAT, entries.data(), &buffer_size);
++    if (!GX_SUCCESS(status) || buffer_size % sizeof(GX_ENUM_DESCRIPTION) != 0 ||
++        buffer_size > entries.size() * sizeof(GX_ENUM_DESCRIPTION)) {
++      RCLCPP_FATAL(this->get_logger(), "Cannot read supported PixelFormat values (status=%d)", status);
++      return false;
++    }
++    const size_t returned_count = buffer_size / sizeof(GX_ENUM_DESCRIPTION);
++
++    // 拜耳8位优先以保留彩色信息；只支持灰度输出的型号回退到 Mono8。
++    const struct PixelFormatChoice {
++      int64_t value;
++      const char * name;
++    } choices[] = {
++      {GX_PIXEL_FORMAT_BAYER_GR8, "BayerGR8"},
++      {GX_PIXEL_FORMAT_BAYER_RG8, "BayerRG8"},
++      {GX_PIXEL_FORMAT_BAYER_GB8, "BayerGB8"},
++      {GX_PIXEL_FORMAT_BAYER_BG8, "BayerBG8"},
++      {GX_PIXEL_FORMAT_MONO8, "Mono8"},
++    };
++    int64_t requested_value = -1;
++    const char * requested_name = nullptr;
++    for (const auto & choice : choices) {
++      for (size_t i = 0; i < returned_count; ++i) {
++        if (entries[i].nValue == choice.value) {
++          requested_value = choice.value;
++          requested_name = choice.name;
++          break;
++        }
++      }
++      if (requested_name != nullptr) break;
++    }
++    if (requested_name == nullptr) {
++      std::string available;
++      for (size_t i = 0; i < returned_count; ++i) {
++        if (!available.empty()) available += ", ";
++        available += std::string(entries[i].szSymbolic,
++          strnlen(entries[i].szSymbolic, sizeof(entries[i].szSymbolic)));
++      }
++      RCLCPP_FATAL(this->get_logger(),
++        "Camera has no supported Bayer8 or Mono8 PixelFormat (available: %s)", available.c_str());
++      return false;
++    }
++
++    bool writable = false;
++    status = GXIsWritable(camera_handle_, GX_ENUM_PIXEL_FORMAT, &writable);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_FATAL(this->get_logger(), "Cannot query PixelFormat writability, status=%d", status);
++      return false;
++    }
++    int64_t actual_value = -1;
++    if (writable) {
++      status = GXSetEnum(camera_handle_, GX_ENUM_PIXEL_FORMAT, requested_value);
++      if (!GX_SUCCESS(status)) {
++        RCLCPP_FATAL(this->get_logger(), "Cannot select %s PixelFormat, status=%d", requested_name, status);
++        return false;
++      }
++    }
++    status = GXGetEnum(camera_handle_, GX_ENUM_PIXEL_FORMAT, &actual_value);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_FATAL(this->get_logger(), "Cannot verify active PixelFormat, status=%d", status);
++      return false;
++    }
++    bool actual_supported = false;
++    const char * actual_name = "unknown";
++    for (const auto & choice : choices) {
++      if (actual_value == choice.value) {
++        actual_supported = true;
++        actual_name = choice.name;
++        break;
++      }
++    }
++    if (!actual_supported || (writable && actual_value != requested_value)) {
++      RCLCPP_FATAL(this->get_logger(),
++        "PixelFormat selection did not take effect (requested=%s, actual=%ld)",
++        requested_name, static_cast<long>(actual_value));
++      return false;
++    }
++
++    selected_pixel_format_ = actual_value;
++    RCLCPP_INFO(this->get_logger(), "Selected PixelFormat=%s (%ld)", actual_name,
++      static_cast<long>(actual_value));
++    return true;
++  }
++
++  bool configureEnumFeature(GX_FEATURE_ID_CMD feature, const char * name, int64_t value)
++  {
++    bool implemented = false;
++    GX_STATUS status = GXIsImplemented(camera_handle_, feature, &implemented);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_ERROR(this->get_logger(), "Cannot query %s support, status = %d", name, status);
++      return false;
++    }
++    if (!implemented) {
++      RCLCPP_WARN(this->get_logger(), "%s is not implemented by this camera", name);
++      return true;
++    }
++
++    bool writable = false;
++    status = GXIsWritable(camera_handle_, feature, &writable);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_ERROR(this->get_logger(), "%s cannot be configured (status=%d, writable=%d)",
++        name, status, writable);
++      return false;
++    }
++    if (!writable) {
++      int64_t current_value = -1;
++      status = GXGetEnum(camera_handle_, feature, &current_value);
++      if (GX_SUCCESS(status) && current_value == value) {
++        return true;
++      }
++      RCLCPP_ERROR(this->get_logger(), "%s is read-only and is not set to the requested value", name);
++      return false;
++    }
++    status = GXSetEnum(camera_handle_, feature, value);
++    if (!GX_SUCCESS(status)) {
++      RCLCPP_ERROR(this->get_logger(), "Failed to set %s, status = %d", name, status);
++      return false;
++    }
++    int64_t actual_value = -1;
++    status = GXGetEnum(camera_handle_, feature, &actual_value);
++    if (!GX_SUCCESS(status) || actual_value != value) {
++      RCLCPP_ERROR(this->get_logger(), "Failed to verify %s (status=%d, value=%ld)",
++        name, status, static_cast<long>(actual_value));
++      return false;
++    }
++    return true;
++  }
++
+   void declareParameters()
+   {
+     rcl_interfaces::msg::ParameterDescriptor param_desc;
+-    double f_value;
+-    GX_FLOAT_RANGE f_range;
++    double current_value = 0.0;
++    GX_FLOAT_RANGE float_range{};
+     param_desc.integer_range.resize(1);
+     param_desc.integer_range[0].step = 1;
+     // Exposure time
+     param_desc.description = "Exposure time in microseconds";
+-    GXGetFloat(camera_handle_, GX_FLOAT_EXPOSURE_TIME, &f_value);
+-    GXGetFloatRange(camera_handle_, GX_FLOAT_EXPOSURE_TIME, &f_range);
+-    param_desc.integer_range[0].from_value = f_range.dMin;
+-    param_desc.integer_range[0].to_value = f_range.dMax;
+-    double exposure_time = this->declare_parameter("exposure_time", 5000, param_desc);
+-    GXSetFloat(camera_handle_, GX_FLOAT_EXPOSURE_TIME, exposure_time);
+-    RCLCPP_INFO(this->get_logger(), "Exposure time: %f", exposure_time);
++    GX_STATUS status = GXGetFloat(camera_handle_, GX_FLOAT_EXPOSURE_TIME, &current_value);
++    if (!GX_SUCCESS(status) || !std::isfinite(current_value)) {
++      throw std::runtime_error("GXGetFloat(ExposureTime) failed or returned an invalid value");
++    }
++    status = GXGetFloatRange(camera_handle_, GX_FLOAT_EXPOSURE_TIME, &float_range);
++    if (!GX_SUCCESS(status) || !std::isfinite(float_range.dMin) ||
++        !std::isfinite(float_range.dMax) || float_range.dMin > float_range.dMax) {
++      throw std::runtime_error("GXGetFloatRange(ExposureTime) failed or returned an invalid range");
++    }
++    const int64_t exposure_min = static_cast<int64_t>(std::ceil(float_range.dMin));
++    const int64_t exposure_max = static_cast<int64_t>(std::floor(float_range.dMax));
++    if (exposure_min > exposure_max) {
++      throw std::runtime_error("Galaxy exposure range has no integer microsecond value");
++    }
++    int64_t exposure_default = static_cast<int64_t>(std::llround(current_value));
++    if (exposure_default < exposure_min) exposure_default = exposure_min;
++    if (exposure_default > exposure_max) exposure_default = exposure_max;
++    param_desc.integer_range[0].from_value = exposure_min;
++    param_desc.integer_range[0].to_value = exposure_max;
++    const int64_t exposure_time = declareCameraParameter<int64_t>(
++      "exposure_time", exposure_default, &param_desc);
++    status = GXSetFloat(camera_handle_, GX_FLOAT_EXPOSURE_TIME,
++      static_cast<double>(exposure_time));
++    if (!GX_SUCCESS(status)) {
++      throw std::runtime_error("GXSetFloat(ExposureTime) failed, status=" + std::to_string(status));
++    }
++    RCLCPP_INFO(this->get_logger(), "Exposure time: %lld", static_cast<long long>(exposure_time));
+ 
+     // Gain
+     param_desc.description = "Gain";
+-    GXGetFloat(camera_handle_, GX_FLOAT_GAIN, &f_value);
+-    GXGetFloatRange(camera_handle_, GX_FLOAT_GAIN, &f_range);
+-    param_desc.integer_range[0].from_value = f_range.dMin;
+-    param_desc.integer_range[0].to_value = f_range.dMax;
+-    double gain = this->declare_parameter("gain", f_value, param_desc);
+-    GXSetFloat(camera_handle_, GX_FLOAT_GAIN, gain);
++    status = GXGetFloat(camera_handle_, GX_FLOAT_GAIN, &current_value);
++    if (!GX_SUCCESS(status) || !std::isfinite(current_value)) {
++      throw std::runtime_error("GXGetFloat(Gain) failed or returned an invalid value");
++    }
++    status = GXGetFloatRange(camera_handle_, GX_FLOAT_GAIN, &float_range);
++    if (!GX_SUCCESS(status) || !std::isfinite(float_range.dMin) ||
++        !std::isfinite(float_range.dMax) || float_range.dMin > float_range.dMax) {
++      throw std::runtime_error("GXGetFloatRange(Gain) failed or returned an invalid range");
++    }
++    param_desc.integer_range.clear();
++    param_desc.floating_point_range.resize(1);
++    param_desc.floating_point_range[0].from_value = float_range.dMin;
++    param_desc.floating_point_range[0].to_value = float_range.dMax;
++    param_desc.floating_point_range[0].step =
++      float_range.bIncIsValid ? float_range.dInc : 0.0;
++    const double gain = declareCameraParameter<double>("gain", current_value, &param_desc);
++    status = GXSetFloat(camera_handle_, GX_FLOAT_GAIN, gain);
++    if (!GX_SUCCESS(status)) {
++      throw std::runtime_error("GXSetFloat(Gain) failed, status=" + std::to_string(status));
++    }
+     RCLCPP_INFO(this->get_logger(), "Gain: %f", gain);
+   }
+ 
+@@ -208,13 +555,13 @@
+     for (const auto & param : parameters) {
+       if (param.get_name() == "exposure_time") {
+         status = GXSetFloat(camera_handle_, GX_FLOAT_EXPOSURE_TIME, param.as_int());
+-        if (GX_SUCCESS(status)) {
++        if (!GX_SUCCESS(status)) {
+           result.successful = false;
+           result.reason = "Failed to set exposure time, status = " + std::to_string(status);
+         }
+       } else if (param.get_name() == "gain") {
+         status = GXSetFloat(camera_handle_, GX_FLOAT_GAIN, param.as_double());
+-        if (GX_SUCCESS(status)) {
++        if (!GX_SUCCESS(status)) {
+           result.successful = false;
+           result.reason = "Failed to set gain, status = " + std::to_string(status);
+         }
+@@ -230,11 +577,13 @@
+ 
+   image_transport::CameraPublisher camera_pub_;
+ 
+-  GX_DEV_HANDLE camera_handle_;
+-  struct {
+-    int64_t nWidthValue, nWidthMax;
+-    int64_t nHeightValue, nHeightMax;
+-  } img_info_;
++  GX_DEV_HANDLE camera_handle_ = nullptr;
++  bool sdk_initialized_ = false;
++  bool camera_open_ = false;
++  bool acquisition_started_ = false;
++  int64_t selected_pixel_format_ = GX_PIXEL_FORMAT_UNDEFINED;
++  std::string camera_serial_;
++  std::string camera_model_;
+ 
+   std::string camera_name_;
+   std::unique_ptr<camera_info_manager::CameraInfoManager> camera_info_manager_;
+--- a/config/camera_params.yaml
++++ b/config/camera_params.yaml
+@@ -1,6 +1,7 @@
+ /galaxy_camera:
+   ros__parameters:
+     camera_name: narrow_stereo
++    camera_serial: ""
+ 
+     exposure_time: 3500
+     gain: 1.0

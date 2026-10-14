@@ -42,6 +42,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import ace_json  # noqa: E402
+from driver_runtime import (runtime_setup, sdk_environment, default_camera_root, build_drivers)  # noqa: E402
+import shlex
 from calibrate_mono import (calibrate, calibration_flags, detect_corners,  # noqa: E402
                             matching_points, ros_yaml)
 from ros_img import to_rgb  # noqa: E402
@@ -118,44 +120,6 @@ def setup_fonts(root):
         return f.actual("family")
     except Exception:
         return mono or ui
-def default_camera_root():
-    """三个相机驱动的工作空间根目录（本工具的“驱动”功能需要它们）。
-
-    优先级：环境变量 CAMERA_ROOT > 常见位置自动探测 > 家目录下的默认猜测。
-    三个驱动各自的子目录名是上游仓库名（ros2-hik-camera-main 等），换位置时只要保证
-    目录名不变、或直接设 CAMERA_ROOT 指到新的根目录即可。
-    """
-    env = os.environ.get("CAMERA_ROOT")
-    if env:
-        return os.path.abspath(os.path.expanduser(env))
-    home = os.path.expanduser("~")
-    for cand in (os.path.join(home, "下载", "camera"),
-                 os.path.join(home, "Downloads", "camera"),
-                 os.path.join(home, "camera"),
-                 os.path.join(home, "camera_ws"),
-                 os.path.join(home, "ws", "camera"),
-                 "/opt/camera"):
-        if os.path.isdir(cand):
-            return cand
-    return os.path.join(home, "下载", "camera")
-
-
-def build_drivers(camera_root):
-    """按驱动根目录生成三个驱动的元信息表。"""
-    return {
-        "hik": dict(
-            label="海康 MVS 工业相机", pkg="hik_camera", exe="hik_camera_node",
-            ws=os.path.join(camera_root, "ros2-hik-camera-main"),
-            node="/hik_camera", exp="exposure_time", gain="gain", cam_name="narrow_stereo"),
-        "galaxy": dict(
-            label="大恒 Galaxy", pkg="galaxy_camera", exe="galaxy_camera_node",
-            ws=os.path.join(camera_root, "rm_vision_ros2_galaxy_camera-master"),
-            node="/galaxy_camera", exp="exposure_time", gain="gain", cam_name="narrow_stereo"),
-        "mv": dict(
-            label="迈德威视", pkg="mindvision_camera", exe="mindvision_camera_node",
-            ws=os.path.join(camera_root, "ros2_mindvision_camera"),
-            node="/mv_camera", exp="exposure_time", gain="analog_gain", cam_name="mv_camera"),
-    }
 
 
 CAMERA_ROOT = default_camera_root()
@@ -207,12 +171,15 @@ def camera_identity_lines(identity):
         lines = ["  厂商         : %s" % (d.get("manufacturer") or "设备未提供"),
                  "  型号         : %s" % (d.get("model") or "设备未提供"),
                  "  序列号       : %s" % (d.get("serial") or "设备未提供"),
-                 "  USB VID:PID  : %s" % d["vid_pid"],
-                 "  USB 端口     : %s" % d["usb_port"]]
+                 "  接口         : %s" % d.get("transport", "USB")]
+        if d.get("vid_pid"):
+            lines.append("  USB VID:PID  : %s" % d["vid_pid"])
+            lines.append("  USB 端口     : %s" % d["usb_port"])
         if d.get("usb_speed"):
             lines.append("  USB 速率     : %s Mb/s" % d["usb_speed"])
         lines.append("  ACE device_id: %s" % (d.get("serial") or "待确认"))
-        lines.append("  ACE vid_pid  : %s" % d["vid_pid"])
+        if d.get("vid_pid"):
+            lines.append("  ACE vid_pid  : %s" % d["vid_pid"])
     elif status == "multiple" and devices:
         lines = ["  设备身份     : 同厂商连接 %d 台，无法确认画面来自哪台" % len(devices)]
         for d in devices:
@@ -224,6 +191,15 @@ def camera_identity_lines(identity):
     if identity.get("image_encoding"):
         lines.append("  ROS 图像编码 : %s（不等同于相机原始 pixel_format）" % identity["image_encoding"])
     return lines
+
+def camera_identity_summary(device):
+    """USB 与 GigE 共用采集日志，网口身份没有 VID:PID 字段。"""
+    interface = device.get("transport") or "USB"
+    if device.get("vid_pid"):
+        interface += " " + device["vid_pid"]
+    return "相机设备：%s；序列号 %s；接口 %s" % (
+        device.get("model") or "型号未知", device.get("serial") or "未提供", interface)
+
 
 TOPIC = "/image_raw"
 MAX_SAMPLES = 300                # 样本张数上限（覆盖度还能涨就该让用户继续采）
@@ -811,12 +787,14 @@ def main():
             self.samples = []
             self.sample_params = []
             self.camera_identity = None
+            self.driver_identity = None
             self.res = None
             self.result_samples = []
             self.session = None
             self.driver_proc = None
             self.driver_env = None
             self.logq = queue.Queue()
+            self.paramq = queue.Queue()
             self._photo = None
             self._last_save = 0.0
             self._last_corners = None
@@ -1015,8 +993,9 @@ def main():
             self.entries = {}
             self.entry_vars = {}
             self.ranges = {}
+            self.scales = {}
             spec = [("exp", "曝光(us)", 100, 200000, 5000),
-                    ("gain", "增益(dB)", 0, 30, 15),
+                    ("gain", "增益", 0, 30, 15),
                     ("sq", "方格(mm)", 1, 200, round(args.square * 1000.0, 2)),
                     ("sw", "宽(角点)", 3, 20, size[0]),
                     ("sh", "高(角点)", 3, 20, size[1])]
@@ -1034,6 +1013,7 @@ def main():
                 # 先把输入框放到最右，再让滑条吃掉中间的宽度
                 s = ttk.Scale(cell, from_=lo, to=hi, variable=v, length=40,
                               command=lambda _=None, k=key: self.on_scale(k))
+                self.scales[key] = s
                 s.pack(side="left", fill="x", expand=True)
                 ev = tk.StringVar(value=self._fmt(key, init))
                 self.entry_vars[key] = ev
@@ -1142,7 +1122,8 @@ def main():
         def _preflight_driver(self):
             """启动前的通用检查：返回 True 表示可以启动。"""
             d = DRIVERS[self.driver]
-            if not os.path.isfile(os.path.join(d["ws"], "install", "setup.bash")):
+            overlay = runtime_setup(self.driver)
+            if not overlay and not os.path.isfile(os.path.join(d["ws"], "install", "setup.bash")):
                 self.log("该驱动还没编译：%s/install 不存在，先在该目录执行 colcon build" % d["ws"])
                 return False
             if self.driver == "galaxy":
@@ -1152,7 +1133,8 @@ def main():
                     self.log("大恒 SDK 需要可写的 %s，请先在终端执行：" % logdir)
                     self.log("    sudo mkdir -p /var/log/Galaxy && sudo chmod 777 /var/log/Galaxy")
                     return False
-            exe = os.path.join(d["ws"], "install", d["pkg"], "lib", d["pkg"], d["exe"])
+            install = os.path.dirname(overlay) if overlay else os.path.join(d["ws"], "install")
+            exe = os.path.join(install, d["pkg"], "lib", d["pkg"], d["exe"])
             if os.path.isfile(exe) and not os.access(exe, os.X_OK):
                 try:
                     os.chmod(exe, 0o755)
@@ -1185,18 +1167,25 @@ def main():
                              if ros and os.path.isfile("/opt/ros/%s/setup.bash" % ros)
                              else ("/opt/ros/humble/setup.bash"
                                    if os.path.isfile("/opt/ros/humble/setup.bash") else ""))
-                code = ('%ssource "%s/install/setup.bash" >/dev/null 2>&1; '
-                        'python3 -c "import os,json;print(json.dumps(dict(os.environ)))"'
-                        % ('source "%s" >/dev/null 2>&1; ' % ros_setup if ros_setup else "", ws))
+                sources = []
+                if ros_setup:
+                    sources.append(ros_setup)
+                base_setup = os.path.join(ws, "install", "setup.bash")
+                if os.path.isfile(base_setup):
+                    sources.append(base_setup)
+                overlay = runtime_setup(self.driver)
+                if overlay:
+                    sources.append(overlay)
+                code = "".join("source %s >/dev/null 2>&1 || exit $?; " % shlex.quote(path)
+                               for path in sources)
+                code += "python3 -c 'import os,json;print(json.dumps(dict(os.environ)))'"
                 out = subprocess.check_output(["bash", "-c", code], text=True)
                 self.driver_env = json.loads(out)
-                # 工作空间 setup 会把自带的旧海康 SDK 放到系统 SDK 前面。
-                # 优先使用已安装的整套 MVS 库，避免 USB 能识别但旧 SDK 枚举不到相机。
-                sdk_dir = "/opt/MVS/lib/64"
-                if self.driver == "hik" and os.path.isfile(os.path.join(sdk_dir, "libMvCameraControl.so")):
-                    lib_path = self.driver_env.get("LD_LIBRARY_PATH", "")
-                    self.driver_env["LD_LIBRARY_PATH"] = sdk_dir + (":" + lib_path if lib_path else "")
-                    self.log("海康驱动优先使用系统 SDK：%s" % sdk_dir)
+                self.driver_env = sdk_environment(self.driver, self.driver_env)
+                self.log("相机运行库优先目录：%s" %
+                         self.driver_env.get("LD_LIBRARY_PATH", "").split(":")[0])
+                if overlay:
+                    self.log("使用兼容修复驱动：%s" % overlay)
             return self.driver_env
 
         def start_driver(self):
@@ -1207,6 +1196,8 @@ def main():
             if not self._preflight_driver():
                 return
             try:
+                self.driver_env = None
+                self.driver_identity = None
                 env = self._driver_env()
             except Exception as e:
                 self.log("准备驱动环境失败: %s" % e)
@@ -1219,8 +1210,15 @@ def main():
             self._logf = open(logf, "w")
             self.driver_log = logf
             self.log("启动 %s ...（日志 %s）" % (d["label"], logf))
+            command = ["ros2", "run", d["pkg"], d["exe"]]
+            if runtime_setup(self.driver):
+                command += ["--ros-args", "-p", "camera_info_url:=file://" +
+                            os.path.join(d["ws"], "config", "camera_info.yaml")]
+                serial = os.environ.get("CALIB_CAMERA_SERIAL", "").strip()
+                if serial:
+                    command += ["-p", "camera_serial:=" + serial]
             self.driver_proc = subprocess.Popen(
-                ["ros2", "run", d["pkg"], d["exe"]], env=env, stdout=subprocess.PIPE,
+                command, env=env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1, start_new_session=True)
             threading.Thread(target=self._pump_driver_log, daemon=True).start()
             self.btn_start.configure(state="disabled")
@@ -1233,6 +1231,16 @@ def main():
                 self._logf.write(line)
                 self._logf.flush()
                 s = line.rstrip()
+                selected = re.search(r"CALIB_SELECTED_CAMERA serial=(\S+) transport=(\S+) model=(.+)", s)
+                if selected:
+                    serial, transport, model = selected.groups()
+                    serial = "" if serial == "unknown" else serial
+                    # 以驱动实际打开的序列号为准，不能把另一台 USB 设备写到 GigE 的报告里。
+                    detected = read_camera_identity(self.driver)
+                    device = next((dict(d) for d in detected["devices"] if d["serial"] == serial), {})
+                    device.update(serial=serial, model=model.strip(), transport=transport)
+                    if p is self.driver_proc:
+                        self.driver_identity = dict(status="confirmed", devices=[device])
                 if s:
                     self.logq.put("驱动| " + s[-160:])
             self.log("驱动已退出")
@@ -1252,15 +1260,47 @@ def main():
                 if not initial:
                     self.log("驱动没在运行，曝光/增益未下发（可先点“启动驱动”）")
                 return
+            if initial and runtime_setup(self.driver):
+                before = {key: self.vars[key].get() for key in ("exp", "gain")}
+                threading.Thread(target=self._read_camera_parameters,
+                                 args=(self.driver, self.driver_proc, before), daemon=True).start()
+                return
             d = DRIVERS[self.driver]
             vals = {d["exp"]: int(round(self.vars["exp"].get())),
-                    d["gain"]: float("%.1f" % self.vars["gain"].get())}
+                    d["gain"]: (int(round(self.vars["gain"].get())) if self.driver == "mv"
+                                else float("%.1f" % self.vars["gain"].get()))}
             for name, val in vals.items():
                 if not initial and self._last_param_sent.get(name) == val:
                     continue
                 self._last_param_sent[name] = val
                 threading.Thread(target=self._set_param, args=(d["node"], name, val),
                                  daemon=True).start()
+
+        def _read_camera_parameters(self, driver, process, before):
+            """换型号时读取实际值和范围，不把通用默认曝光/增益强加给设备。"""
+            d = DRIVERS[driver]
+            values = {}
+            try:
+                env = self._driver_env()
+                names = [d["exp"], d["gain"]]
+                description = subprocess.run(["ros2", "param", "describe", d["node"]] + names,
+                                             env=env, capture_output=True, text=True, timeout=8)
+                for key, name in zip(("exp", "gain"), names):
+                    result = subprocess.run(["ros2", "param", "get", d["node"], name],
+                                            env=env, capture_output=True, text=True, timeout=5)
+                    match = re.search(r"value is: ([^\s]+)", result.stdout)
+                    if result.returncode or not match:
+                        continue
+                    value = float(match.group(1))
+                    section = next((part for part in description.stdout.split("Parameter name:")
+                                    if part.strip() and part.strip().splitlines()[0] == name), "")
+                    lo = re.search(r"Min value: ([^\s]+)", section)
+                    hi = re.search(r"Max value: ([^\s]+)", section)
+                    bounds = (float(lo.group(1)), float(hi.group(1))) if lo and hi else None
+                    values[key] = (value, bounds)
+                self.paramq.put((driver, process, before, values))
+            except Exception as e:
+                self.log("读取相机曝光/增益失败，未覆盖设备当前值：%s" % e)
 
         def _set_param(self, node, name, val):
             try:
@@ -1342,14 +1382,13 @@ def main():
         def _remember_camera_identity(self):
             if self.camera_identity is not None:
                 return
-            identity = read_camera_identity(self.driver)
+            identity = self.driver_identity or read_camera_identity(self.driver)
             with self.lock:
                 identity["image_encoding"] = self.state.get("image_encoding", "")
             self.camera_identity = identity
             if identity["status"] == "confirmed":
                 d = identity["devices"][0]
-                self.log("相机设备：%s；序列号 %s；USB %s" % (
-                    d["model"] or "型号未知", d["serial"] or "未提供", d["vid_pid"]))
+                self.log(camera_identity_summary(d))
             else:
                 self.log("相机身份未能唯一确认；检验报告会列出设备状态和候选")
 
@@ -1867,6 +1906,18 @@ def main():
                 self.log("[诊断] 失败 %s" % e)
 
         def _drain_log(self):
+            while not self.paramq.empty():
+                driver, process, before, values = self.paramq.get_nowait()
+                if driver != self.driver or process is not self.driver_proc:
+                    continue
+                for key, (value, bounds) in values.items():
+                    if bounds and bounds[0] <= bounds[1]:
+                        self.ranges[key] = bounds
+                        self.scales[key].configure(from_=bounds[0], to=bounds[1])
+                    if self.vars[key].get() == before[key]:
+                        self.vars[key].set(value)
+                        self.entry_vars[key].set(self._fmt(key, value))
+                self.log("已读取实际曝光/增益及设备范围；保留相机当前设置")
             lines = []
             while len(lines) < 30:
                 try:

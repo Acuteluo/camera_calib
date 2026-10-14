@@ -1,7 +1,8 @@
 # 三个相机驱动（海康 / 大恒 / 迈德威视）标定实操指南
 
-> 针对 `$CAMERA_ROOT` 里这三个 ROS 2 驱动。下面每一条"实测"结论都在本机跑过；
-> 唯一没条件跑的是"相机插上后标定 GUI 的全流程"（当前没有工业相机接入）。
+> 下表是早期未接相机时的历史检查，枚举 0 台只能说明走到了枚举流程。
+> 2026-10-13 发现随包海康 SDK 3.2.1 无法识别已接设备，系统 4.8.2.2 可取图。
+> 当前三厂兼容修复和验证范围以 `driver_patches/README.md` 为准。
 
 配套脚本：`ros2_calibrate.sh`（自动探测话题、起标定、回写结果）。
 海康的逐条命令启动顺序（含预期输出与故障对照表）：见 `海康标定全流程.md`。
@@ -12,9 +13,9 @@
 
 | 驱动目录 | ROS 包 | 相机 | SDK 实测 | 结论 |
 |---|---|---|---|---|
-| `ros2-hik-camera-main` | `hik_camera` | 海康机器人 USB3（本机 udev 规则显示是 **MV-CS016-10UC**） | ✅ `Found camera count = 0`（SDK 正常，仅缺相机） | **可直接用** |
-| `rm_vision_ros2_galaxy_camera-master` | `galaxy_camera` | 大恒 Galaxy USB3 | ✅ `No camera found. device_count = 0`（两个版本 SDK 都正常） | **可直接用**，见 §5 |
-| `ros2_mindvision_camera` | `mindvision_camera` | 迈德威视 USB | ✅ `Found camera count = 0` | 可直接用，udev 规则有瑕疵，见 §6 |
+| `ros2-hik-camera-main` | `hik_camera` | 海康机器人 USB3（本机 udev 规则显示是 **MV-CS016-10UC**） | ✅ `Found camera count = 0`（当时无相机，未证明型号兼容） | 历史未接机检查 |
+| `rm_vision_ros2_galaxy_camera-master` | `galaxy_camera` | 大恒 Galaxy USB3 | ✅ `No camera found. device_count = 0`（当时无相机，未证明取流兼容） | 历史未接机检查，见 §5 |
+| `ros2_mindvision_camera` | `mindvision_camera` | 迈德威视 USB | ✅ `Found camera count = 0` | 历史未接机检查，udev 规则有瑕疵，见 §6 |
 
 三个都已经 `colcon build` 过，`install/` 里的 `lib*.so` 都是 **x86-64**（不是 arm64 那份），架构没问题。
 

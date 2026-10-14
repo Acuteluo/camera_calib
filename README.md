@@ -182,7 +182,7 @@ export ACE_TEMPLATE=/path/to/camera.json     # ACE 相机配置模板（可选�
 | ROS apt 源 | USTC 镜像 `mirrors.ustc.edu.cn/ros2/ubuntu` | ✅ 有候选版本，能装 |
 | `camera_calibration` 等包 | **未安装**（候选 3.0.9） | 需 `sudo apt install` |
 | OpenCV | pip 装的是 4.11.0 | ⚠️ 与 apt 的 4.5.4 并存，见 §6 坑位 |
-| 海康 SDK | `/opt/MVS` **不存在**，但 `下载/camera/ros2-hik-camera-main` 自带 `hikSDK` 且已编译好 | 实测该驱动的 SDK **能正常枚举**，所以**不必装 MVS** 就能取流标定，详见 `ROS2_三驱动标定指南.md` |
+| 海康 SDK | 本机已安装 `/opt/MVS`，SDK API 版本 4.8.2.2 | 旧随包 SDK 3.2.1 曾无法识别已连接的相机；修复版编译和运行使用同一套新 SDK，见下方兼容驱动说明 |
 | 相机设备 | 当前**没有** `/dev/video*` | 相机没插，或走的不是 UVC |
 | 用户组 | `cly` 不在 `video` 组 | 用 `/dev/video*` 前需处理 |
 
@@ -249,17 +249,43 @@ ros2 run v4l2_camera v4l2_camera_node --ros-args -p video_device:=/dev/video0 \
 
 **类型 B（RTSP 网络摄像机）**：用 `gscam` 或 `ffmpeg_image_transport`，也可以直接用第 3 节的纯 OpenCV 工具采图（最省事）。
 
-**类型 A（MV 工业相机）**：**本机已经有现成方案，不需要装 MVS**：
-`$CAMERA_ROOT/ros2-hik-camera-main`（`hik_camera` 包，自带 `hikSDK`，已编译）实测可正常加载 SDK，
-启动后发布 `/image_raw`（`rgb8`）。直接：
+**类型 A（MV 工业相机）**：使用厂商 SDK，不能仅凭“枚举 0 台”判断兼容。
+本机旧随包 MVS SDK 3.2.1 曾识别不到已接入的 MV-CS016-10UC；系统 SDK 4.8.2.2
+可正常识别和取图。更换型号时，必须使用支持该型号的 SDK；接口也须由驱动支持。
+
+本仓库保存三厂驱动兼容补丁。新电脑默认已准备好 OpenCV 和 ROS 2，
+再把三厂完整源码/SDK 放在 `$CAMERA_ROOT` 下，按以下顺序检查、构建、启动：
 
 ```bash
-./ros2_calibrate.sh check hik     # 先确认 SDK 与相机
-./ros2_calibrate.sh run   hik --size 8x6 --square 0.0247
+# 非 Humble 发行版先 source 对应 /opt/ros/<发行版>/setup.bash
+export CAMERA_ROOT=/path/to/camera
+/usr/bin/python3 -s build_camera_drivers.py --check hik galaxy mv
+/usr/bin/python3 -s build_camera_drivers.py hik galaxy mv
+./run_gui.sh --driver hik
 ```
 
-若确实需要 MVS（例如要改相机内部 ROI/binning/用户参数），再从海康机器人官网装 `.deb`
-（`sudo dpkg -i MVS-*.deb`）。另外社区也有其他驱动（`hikrobot_camera`、`hik_camera`、`hikvision_ros2_driver`）。
+`--check` 只检查源码、SDK 架构、补丁匹配和驱动构建工具，不编译、不打开相机；
+无需先有原工作空间的 `install/`。只用一家时只传该家，例如 `--check hik`。
+本轮已从原始驱动压缩包重新解压、去掉 `build/install/log`，完成三厂独立构建验证。
+补丁支持本机归档源码，其他上游版本不匹配时会明确报错，不强行应用。
+
+编译默认海康优先 `/opt/MVS`，否则随包 `hikSDK`；大恒和迈德威视默认随包 SDK。
+可在编译前通过 `HIK_SDK_ROOT`、`GALAXY_SDK_ROOT`、`MV_SDK_ROOT` 指定完整 SDK 根目录。
+头文件、链接库和安装的运行库来自同一目录；不能只更换单个 `.so`。
+编译产物保存在 `.driver_runtime/`（不入库），成功后才切换启用链接，原工作空间不改写。
+代码补丁更新后须重建；运行时会拒绝过期补丁对应的驱动。
+
+单台自动选择，不按型号过滤；多台须指定序列号，避免标错相机：
+
+```bash
+CALIB_CAMERA_SERIAL=实际序列号 ./run_gui.sh --driver hik
+# 命令行同样支持 CALIB_CAMERA_SERIAL
+```
+
+USB 使用正确的厂商 udev 权限、USB3 线与供电；GigE 相机和网卡应设置兼容网段，
+大恒跨网段枚举不等于可以跨网段取流。驱动会关闭触发模式以连续采图。
+支持面阵单目标定，线阵、采集卡接口、深度相机等应使用对应取流方案。
+三厂具体修复、验证范围及回退方法见 [驱动兼容说明](driver_patches/README.md)。
 
 ### 2.3 起标定程序
 
@@ -456,7 +482,7 @@ self.P[:3, :3] = ncm
    引入系统性焦距误差，且 RMS 看不出来（RMS 对整体尺度不敏感）。→ 实测。
 8. **工业相机(MV 系列)插上却没有 `/dev/video0`**
    它走 USB3 Vision/GigE Vision，不是 UVC —— 这是正常的。用 `hik_camera` 驱动即可
-   （`./ros2_calibrate.sh run hik`），本机已自带 SDK 且实测可用。
+   （`./ros2_calibrate.sh run hik`）；先使用兼容 SDK 编译修复驱动，见 §2.2。
 9. **`/dev/video0: Permission denied`**
    → `sudo usermod -aG video $USER` 后**重新登录**（或临时 `sudo chmod 666 /dev/video0`）。
 10. **高分辨率下 UVC 掉帧**
