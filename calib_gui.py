@@ -144,7 +144,7 @@ def build_drivers(camera_root):
     """按驱动根目录生成三个驱动的元信息表。"""
     return {
         "hik": dict(
-            label="海康 MV-CS016-10UC", pkg="hik_camera", exe="hik_camera_node",
+            label="海康 MVS 工业相机", pkg="hik_camera", exe="hik_camera_node",
             ws=os.path.join(camera_root, "ros2-hik-camera-main"),
             node="/hik_camera", exp="exposure_time", gain="gain", cam_name="narrow_stereo"),
         "galaxy": dict(
@@ -160,6 +160,70 @@ def build_drivers(camera_root):
 
 CAMERA_ROOT = default_camera_root()
 DRIVERS = build_drivers(CAMERA_ROOT)
+
+# 只按驱动对应的 USB 厂商筛选；同厂商多台相机时不能猜哪台在发布画面。
+USB_CAMERA_VENDORS = {"hik": {"2bdf"}, "galaxy": {"2ba2"}, "mv": {"f622", "080b"}}
+
+
+def read_camera_identity(driver, sysfs_root="/sys/bus/usb/devices"):
+    """读取采集时实际连接的 USB 设备身份；多台匹配时保留候选，不冒认序列号。"""
+    def read(path):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    devices = []
+    try:
+        entries = sorted(os.scandir(sysfs_root), key=lambda entry: entry.name)
+    except OSError:
+        entries = []
+    for entry in entries:
+        base = entry.path
+        vendor = read(os.path.join(base, "idVendor")).lower()
+        if vendor not in USB_CAMERA_VENDORS.get(driver, set()):
+            continue
+        product_id = read(os.path.join(base, "idProduct")).lower()
+        if not product_id:
+            continue
+        devices.append(dict(manufacturer=read(os.path.join(base, "manufacturer")),
+                            model=read(os.path.join(base, "product")),
+                            serial=read(os.path.join(base, "serial")),
+                            vid_pid="%s:%s" % (vendor, product_id),
+                            usb_port=entry.name,
+                            usb_speed=read(os.path.join(base, "speed"))))
+    return dict(status="confirmed" if len(devices) == 1 else
+                ("multiple" if devices else "unavailable"), devices=devices)
+
+
+def camera_identity_lines(identity):
+    """报告及说明文件共用同一份采集时设备快照。"""
+    identity = identity or {}
+    devices = identity.get("devices", [])
+    status = identity.get("status", "unavailable")
+    if status == "confirmed" and len(devices) == 1:
+        d = devices[0]
+        lines = ["  厂商         : %s" % (d.get("manufacturer") or "设备未提供"),
+                 "  型号         : %s" % (d.get("model") or "设备未提供"),
+                 "  序列号       : %s" % (d.get("serial") or "设备未提供"),
+                 "  USB VID:PID  : %s" % d["vid_pid"],
+                 "  USB 端口     : %s" % d["usb_port"]]
+        if d.get("usb_speed"):
+            lines.append("  USB 速率     : %s Mb/s" % d["usb_speed"])
+        lines.append("  ACE device_id: %s" % (d.get("serial") or "待确认"))
+        lines.append("  ACE vid_pid  : %s" % d["vid_pid"])
+    elif status == "multiple" and devices:
+        lines = ["  设备身份     : 同厂商连接 %d 台，无法确认画面来自哪台" % len(devices)]
+        for d in devices:
+            lines.append("  候选         : %s / 序列号 %s / %s / USB %s" % (
+                d.get("model") or "型号未知", d.get("serial") or "未提供",
+                d["vid_pid"], d["usb_port"]))
+    else:
+        lines = ["  设备身份     : 未检测到对应 USB 相机（GigE/离线相机需另行核对）"]
+    if identity.get("image_encoding"):
+        lines.append("  ROS 图像编码 : %s（不等同于相机原始 pixel_format）" % identity["image_encoding"])
+    return lines
 
 TOPIC = "/image_raw"
 MAX_SAMPLES = 300                # 样本张数上限（覆盖度还能涨就该让用户继续采）
@@ -425,6 +489,10 @@ def build_report(driver, res, square, size, topic):
     lines.append("分辨率     : %dx%d" % res["image_size"])
     lines.append("棋盘格     : %d x %d 内角点，方格 %.2f mm" % (size[0], size[1], square * 1000))
     lines.append("")
+    lines.append("-- 相机设备（首次采集时读取）--")
+    lines.extend(camera_identity_lines(res.get("camera_identity")))
+    lines.append("  注：ACE 导出沿用参考文件的 device_id/vid_pid；更换相机后请按上面实测值核对。")
+    lines.append("")
     lines.append("-- 结论 --")
     for name, judge in verdict_lines(res, square):
         lines.append("  %-24s %s" % (name, judge))
@@ -537,6 +605,8 @@ def save_outputs(driver, res, samples, size, square, session=None, camera_name=N
                 % (time.strftime("%Y-%m-%d %H:%M:%S"), DRIVERS[driver]["label"],
                    size[0], size[1], square * 1000, res["image_size"][0], res["image_size"][1],
                    res["n_views"], res["rms"], res["coverage"] * 100, ace_name))
+        f.write("相机设备（首次采集时读取）:\n" + "\n".join(
+            camera_identity_lines(res.get("camera_identity"))) + "\n")
     return session
 
 
@@ -653,6 +723,7 @@ class CameraThread(threading.Thread):
             self.state["ncorner"] = n
             self.state["gray"] = gray_full
             self.state["stamp"] = now
+            self.state["image_encoding"] = msg.encoding
 
     def run(self):
         import rclpy
@@ -739,6 +810,7 @@ def main():
             self.ace_template = args.ace_template
             self.samples = []
             self.sample_params = []
+            self.camera_identity = None
             self.res = None
             self.result_samples = []
             self.session = None
@@ -1118,6 +1190,13 @@ def main():
                         % ('source "%s" >/dev/null 2>&1; ' % ros_setup if ros_setup else "", ws))
                 out = subprocess.check_output(["bash", "-c", code], text=True)
                 self.driver_env = json.loads(out)
+                # 工作空间 setup 会把自带的旧海康 SDK 放到系统 SDK 前面。
+                # 优先使用已安装的整套 MVS 库，避免 USB 能识别但旧 SDK 枚举不到相机。
+                sdk_dir = "/opt/MVS/lib/64"
+                if self.driver == "hik" and os.path.isfile(os.path.join(sdk_dir, "libMvCameraControl.so")):
+                    lib_path = self.driver_env.get("LD_LIBRARY_PATH", "")
+                    self.driver_env["LD_LIBRARY_PATH"] = sdk_dir + (":" + lib_path if lib_path else "")
+                    self.log("海康驱动优先使用系统 SDK：%s" % sdk_dir)
             return self.driver_env
 
         def start_driver(self):
@@ -1216,6 +1295,7 @@ def main():
                 self.log("样本已满 %d 张（约 %d MB）：可先【标定】，或点【应用尺寸】清空重来"
                          % (self.max_samples, self.sample_bytes // (1024 * 1024)))
                 return
+            self._remember_camera_identity()
             s_new = Sample(gray, corners)
             self.samples.append(s_new)
             self.sample_bytes += s_new.arr.nbytes
@@ -1241,6 +1321,7 @@ def main():
                              "先点【标定】，或点【应用尺寸】清空重来。"
                              % (self.max_samples, self.sample_bytes // (1024 * 1024)))
                 return
+            self._remember_camera_identity()
             if self._last_corners is not None and len(self._last_corners) == len(corners):
                 shift = float(np.linalg.norm(
                     corners.reshape(-1, 2) - self._last_corners.reshape(-1, 2), axis=1).mean())
@@ -1258,6 +1339,20 @@ def main():
             self.log("自动采集第 %d 张" % len(self.samples))
 
         # ---------------- 标定 / 检验 / 输出 ----------------
+        def _remember_camera_identity(self):
+            if self.camera_identity is not None:
+                return
+            identity = read_camera_identity(self.driver)
+            with self.lock:
+                identity["image_encoding"] = self.state.get("image_encoding", "")
+            self.camera_identity = identity
+            if identity["status"] == "confirmed":
+                d = identity["devices"][0]
+                self.log("相机设备：%s；序列号 %s；USB %s" % (
+                    d["model"] or "型号未知", d["serial"] or "未提供", d["vid_pid"]))
+            else:
+                self.log("相机身份未能唯一确认；检验报告会列出设备状态和候选")
+
         def _record_cover(self, corners, shape):
             sz = self.state["size"]
             prm = coverage_params(corners, (shape[1], shape[0]), sz)
@@ -1298,7 +1393,8 @@ def main():
             def work():
                 try:
                     result = calibrate_samples(samples, sz, square, k=2)
-                    result.update(driver=driver, topic=topic)
+                    result.update(driver=driver, topic=topic,
+                                  camera_identity=self.camera_identity)
                     self._calib_result = ("ok", (result, samples))
                 except Exception as e:  # noqa: BLE001
                     self._calib_result = ("err", str(e))
@@ -1525,6 +1621,7 @@ def main():
             sz = (int(round(self.vars["sw"].get())), int(round(self.vars["sh"].get())))
             self.samples.clear()
             self.sample_params = []
+            self.camera_identity = None
             self.sample_bytes = 0
             self._cap_warned = False
             self.res = None

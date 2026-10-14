@@ -143,8 +143,13 @@ def calibration_flags(args):
 
 
 def calibrate(objpoints, imgpoints, image_size, flags):
+    # 每个视图都增加 6 个位姿参数；大量样本时默认 SVD 的求解成本很高。
+    # QR 只替换线性求解方法，保留全部视图、畸变模型和默认收敛条件。
+    solver_flags = flags
+    if not (flags & (cv2.CALIB_USE_QR | cv2.CALIB_USE_LU)):
+        solver_flags |= cv2.CALIB_USE_QR
     rms, K, D, rvecs, tvecs = cv2.calibrateCamera(
-        objpoints, imgpoints, image_size, None, None, flags=flags
+        objpoints, imgpoints, image_size, None, None, flags=solver_flags
     )
     per_view = []
     for i, (op, ip) in enumerate(zip(objpoints, imgpoints)):

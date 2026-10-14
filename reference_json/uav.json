@@ -7,19 +7,19 @@
     // 角点检测器口径；同一内参在 SB 精确角点上独立重算 RMS 0.0793 px。结果目录
     // camera_calib/标定结果/20260923_011956_hik_11x8。内参、畸变、投影矩阵与安装外参同时替换，
     // 采集参数保持原值。
-    "schema_version": 1, // 文档首键
-    "cameras": {
-        "camera_0": {
+    "schema_version": 1, // 配置格式版本；必须为 1 且位于文档首键，否则加载失败
+    "cameras": { // 逻辑相机节点集合；由兵种参数 camera.camera_index 选择 camera_N
+        "camera_0": { // 逻辑相机标定与采集参数；N 与兵种 camera.camera_index 相同才会被选用
             // 相机外参："a b c" 空格分隔三分量；use_pose_ba 时必填，缺失或非法启动失败
-            "odom2camera": {
+            "odom2camera": { // 机身到相机的安装外参；用于位姿变换和多帧位姿优化
                 "xyz": "-0.10201 0.0  -0.0715", // 相机光心在 body 系位置，米，{x,y,z}；台架实测 (-102.01, 0.0, -71.5) mm
                 "rpy": "0.0  0.0  0.0" // body 系 ZYX 安装角，degree，{roll,pitch,yaw}
             },
             // 采集参数（hik 相机后端消费）；0 值多为"不覆盖相机当前值"的占位
-            "camera_config": {
+            "camera_config": { // 采集设备设置；仅实际选用的相机节点及对应后端读取
                 "max_read_fps": 0, // 采集帧率上限，Hz；0 不限制
-                "width": 1440, // 【死键】透传字段：运行期无消费方（采集宽高取实际帧）
-                "height": 1080, // 【死键】透传字段：运行期无消费方
+                "width": 1440, // 预留采集宽度，像素；实际取设备帧宽度，修改本键不生效
+                "height": 1080, // 预留采集高度，像素；实际取设备帧高度，修改本键不生效
                 "bayer_cvt_quality": 2, // Bayer 转换质量；0 不覆盖
                 "pixel_format": "0x01080009", // 像素格式串（0x 或十进制）；空串保持相机默认
                 "adc_bit_depth": 12, // ADC 位深，仅支持 8/10/12；0 不覆盖
@@ -29,18 +29,18 @@
                 // 本相机自己的模式曝光/增益三组（2026-09-25 由 modes.json 下沉，形态二）：
                 // 开流初值取 profile.setting_workmode 对应那组，运行期由 mode_sync 按模式边沿切换；
                 // exposure_ms 键名为历史遗留，实际口径是微秒，直读不换算。
-                "auto_aim": { "exposure_ms": 3400, "gain": 15 }, // 自瞄模式
-                "outpost": { "exposure_ms": 6000, "gain": 15 }, // 前哨站模式
-                "buff": { "exposure_ms": 2000, "gain": 15 } // 打符模式
+                "auto_aim": { "exposure_ms": 3400, "gain": 15 }, // 自瞄模式：exposure_ms 为曝光时间（微秒），影响亮度和拖影；gain 为增益，影响亮度和噪声
+                "outpost": { "exposure_ms": 6000, "gain": 15 }, // 前哨站模式：exposure_ms 为曝光时间（微秒），影响亮度和拖影；gain 为增益，影响亮度和噪声
+                "buff": { "exposure_ms": 2000, "gain": 15 } // 打符模式：exposure_ms 为曝光时间（微秒），影响亮度和拖影；gain 为增益，影响亮度和噪声
             },
-            "image_width": 1440, // 【死键】透传字段：运行期无消费方
-            "image_height": 1080, // 【死键】透传字段：运行期无消费方
-            "camera_name": "narrow_stereo", // 【死键】透传字段：运行期无消费方
+            "image_width": 1440, // 预留图像宽度元数据，像素；运行期取实际帧宽度，修改不生效
+            "image_height": 1080, // 预留图像高度元数据，像素；运行期取实际帧高度，修改不生效
+            "camera_name": "narrow_stereo", // 预留相机名称标识；当前无消费方，修改不生效
             // 3x3 相机内参，行主序；fx/fy 焦距像素、cx/cy 主点像素；PnP 解算消费，fx/fy 必须为正
-            "camera_matrix": {
-                "rows": 3, // 【死键】透传字段：运行期无消费方
-                "cols": 3, // 【死键】透传字段：运行期无消费方
-                "data": [
+            "camera_matrix": { // 相机内参矩阵；焦距和主点影响 PnP 位姿解算
+                "rows": 3, // 记录内参矩阵行数；运行期只读取 data，修改不生效
+                "cols": 3, // 记录内参矩阵列数；运行期只读取 data，修改不生效
+                "data": [ // 按行排列的 3×3 内参 [fx,0,cx, 0,fy,cy, 0,0,1]；影响 PnP 位姿
                     1758.45314,
                     0.0,
                     734.19835,
@@ -52,12 +52,12 @@
                     1.0
                 ]
             },
-            "distortion_model": "plumb_bob", // 【死键】透传字段：运行期无消费方
+            "distortion_model": "plumb_bob", // 预留畸变模型名称；运行期按系数数组解算，修改本键不生效
             // 畸变系数；长度须为 OpenCV 支持的 4/5/8/12/14，通常为 (k1,k2,p1,p2,k3)，其它长度使 solvePnP 运行期抛异常
-            "distortion_coefficients": {
-                "rows": 1, // 【死键】透传字段：运行期无消费方
-                "cols": 5, // 【死键】透传字段：运行期无消费方
-                "data": [
+            "distortion_coefficients": { // 镜头畸变参数；影响像素去畸变和 PnP 位姿
+                "rows": 1, // 记录畸变系数矩阵行数；运行期只读取 data，修改不生效
+                "cols": 5, // 记录畸变系数矩阵列数；运行期只读取 data，修改不生效
+                "data": [ // 畸变系数数组；常见顺序为 k1,k2,p1,p2,k3，供 PnP 解算
                     -0.060136,
                     0.113321,
                     -0.000556,
@@ -66,10 +66,10 @@
                 ]
             },
             // 【死键】透传字段：运行期无消费方（含 rows/cols/data）
-            "rectification_matrix": {
-                "rows": 3,
-                "cols": 3,
-                "data": [
+            "rectification_matrix": { // 原预留校正矩阵；运行期无消费方，修改不生效
+                "rows": 3, // 校正矩阵行数；运行期无消费方，修改不生效
+                "cols": 3, // 校正矩阵列数；运行期无消费方，修改不生效
+                "data": [ // 校正矩阵的行主序数值；运行期无消费方，修改不生效
                     1.0,
                     0.0,
                     0.0,
@@ -82,10 +82,10 @@
                 ]
             },
             // 【死键】透传字段：运行期无消费方（含 rows/cols/data）
-            "projection_matrix": {
-                "rows": 3,
-                "cols": 4,
-                "data": [
+            "projection_matrix": { // 原预留投影矩阵；运行期无消费方，修改不生效
+                "rows": 3, // 投影矩阵行数；运行期无消费方，修改不生效
+                "cols": 4, // 投影矩阵列数；运行期无消费方，修改不生效
+                "data": [ // 投影矩阵的行主序数值；运行期无消费方，修改不生效
                     1746.23947,
                     0.0,
                     734.42027,

@@ -146,8 +146,18 @@ def _replace_array(text, key, values, prec):
     start, end = _find_object(text, key)
     a, b = _find_array_in(text, start, end)
     seg = text[a:b]
+    # 跳过注释里的数字，系数数量不变时只替换数值，保留数组说明及排版。
+    tokens = list(re.finditer(r'//[^\n]*|/\*.*?\*/|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+                             seg, re.DOTALL))
+    numbers = [m for m in tokens if not m.group().startswith('/')]
+    if len(numbers) == len(values):
+        for m, value in reversed(list(zip(numbers, values))):
+            seg = seg[:m.start()] + _fmt(value, prec) + seg[m.end():]
+        return text[:a] + seg + text[b:]
+    # 畸变系数数量变化时重新排列数值，但保留 '[' 后的数组说明。
+    prefix = seg[:numbers[0].start()].rstrip() if numbers else "["
     if "\n" not in seg:                                   # 单行数组：保持单行
-        new = "[" + ", ".join(_fmt(v, prec) for v in values) + "]"
+        new = prefix + (" " if prefix != "[" else "") + ", ".join(_fmt(v, prec) for v in values) + "]"
     else:
         m = re.search(r"\n([ \t]*)\S", seg)               # 取值行的缩进
         indent = m.group(1) if m else " " * 4
@@ -157,7 +167,7 @@ def _replace_array(text, key, values, prec):
         for i, v in enumerate(values):
             items.append("%s%s%s" % (indent, _fmt(v, prec),
                                     "," if i < len(values) - 1 else ""))
-        new = "[\n" + "\n".join(items) + "\n" + close_indent + "]"
+        new = prefix + "\n" + "\n".join(items) + "\n" + close_indent + "]"
     return text[:a] + new + text[b:]
 
 
