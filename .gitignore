@@ -22,3 +22,6 @@ venv/
 
 # 独立编译的厂商驱动和 SDK（源码补丁在 driver_patches 中）
 .driver_runtime/
+
+# 按主机保存的本地 SSH 配置（可含用户选择记住的密码）
+ssh_configs/

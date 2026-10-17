@@ -42,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import ace_json  # noqa: E402
+import ssh_profiles  # noqa: E402
 from driver_runtime import (runtime_setup, sdk_environment, default_camera_root, build_drivers)  # noqa: E402
 import shlex
 from calibrate_mono import (calibrate, calibration_flags, detect_corners,  # noqa: E402
@@ -202,6 +203,15 @@ def camera_identity_summary(device):
 
 
 TOPIC = "/image_raw"
+
+
+def source_start_hint(source, topic):
+    """已有画面只可通过对应 ROS 话题订阅，SSH 启动驱动需要设备独占。"""
+    if source == "ssh":
+        return ("SSH 模式：先停止远端占用相机的 ACE 或其他程序，再点【启动驱动】。"
+                "ACE 内部画面不会自动接入本工具。")
+    return ("本地模式：点【启动驱动】，或订阅本机同一 ROS 域中已有的图像话题 %s。"
+            "仅在其他软件中打开相机，不等于发布了此话题。" % topic)
 MAX_SAMPLES = 300                # 样本张数上限（覆盖度还能涨就该让用户继续采）
 SAMPLE_MEMORY_BUDGET = 1_500_000_000   # 样本内存预算 1.5GB（超了按分辨率自动收紧张数）
 MAX_RENDER_PIXELS = 3_000_000     # 显示图最大像素数（全屏约 1828x1371；再大贴图开始卡）
@@ -627,7 +637,7 @@ class CameraThread(threading.Thread):
         if os.environ.get("CALIB_GUI_DEBUG"):
             self._img_in = getattr(self, "_img_in", 0) + 1
         with self.lock:
-            interval = self.state["interval"]
+            interval = getattr(self, "preview_interval", self.state["interval"])
         if now - self._last_detect < interval:
             return
         self._last_detect = now
@@ -651,7 +661,7 @@ class CameraThread(threading.Thread):
 
         # --- 1) 预览检测：常规缩到 <=480px（~28ms）；连续检不到就用原分辨率兜底试一次 ---
         k = min(1.0, PREVIEW_DETECT_MAX / float(max(w, h)))
-        if k < 1.0 and self._fail_streak < 8:
+        if k < 1.0 and (self._fail_streak < 8 or not getattr(self, "full_preview_fallback", True)):
             det_img = cv2.resize(gray_full, None, fx=k, fy=k, interpolation=cv2.INTER_AREA)
             det_k = k
         else:
@@ -690,8 +700,8 @@ class CameraThread(threading.Thread):
             cv2.drawChessboardCorners(view, (int(size[0]), int(size[1])), pts, True)
 
         with self.lock:
-            if generation != self.state.get("generation", 0):
-                return   # 配置已重置，丢弃处理到一半的旧帧。
+            if self._stop_requested or generation != self.state.get("generation", 0):
+                return   # 停止或配置已重置，丢弃处理到一半的旧帧。
             self.state["native"] = (w, h)
             self.state["disp_rgb"] = view                 # 已是 RGB，UI 直接贴图
             self.state["bgr"] = view                      # 兼容“当前帧是否存在”的判断
@@ -739,6 +749,13 @@ def main():
     ap.add_argument("--driver", default="hik", choices=("hik", "galaxy", "mv"))
     ap.add_argument("--size", default="11x8", help="内角点数，如 11x8（12x9 个方格 -> 11x8）")
     ap.add_argument("--square", type=float, default=0.025, help="方格边长，米（默认 25mm）")
+    ap.add_argument("--source", choices=("local", "ssh"), default="local",
+                    help="图像来源：本地 ROS 或 SSH 远程相机")
+    ap.add_argument("--ssh-host", default="", help="user@host 或 ~/.ssh/config 中的主机别名")
+    ap.add_argument("--ssh-port", type=int, default=22)
+    ap.add_argument("--ssh-key", default="", help="SSH 私钥文件，可留空使用 SSH 默认配置")
+    ap.add_argument("--remote-dir", default="~/camera_calib", help="小电脑上本项目的目录")
+    ap.add_argument("--remote-camera-root", default="", help="小电脑驱动根目录，留空自动探测")
     ap.add_argument("--topic", default=TOPIC)
     ap.add_argument("--camera-root", default=None,
                     help="三个相机驱动的工作空间根目录（默认自动探测，或设环境变量 CAMERA_ROOT）")
@@ -781,6 +798,16 @@ def main():
             self.state = dict(bgr=None, gray=None, stamp=0.0, corners=None,
                               ncorner=0, size=size, square=args.square, generation=0, decode_err=None, disp_rgb=None,
                               want_size=None, undist=False, maps=None, interval=0.08)
+            self.source = args.source
+            self.remote = None
+            self.remote_thread = None
+            self.cam = None
+            self.ssh_port = args.ssh_port
+            self.ssh_key = args.ssh_key
+            self.ssh_password = ""
+            self.remember_ssh_password = tk.BooleanVar(value=False)
+            self.remote_dir = args.remote_dir
+            self.remote_camera_root = args.remote_camera_root
             self.driver = args.driver
             self.topic = args.topic
             self.ace_template = args.ace_template
@@ -795,6 +822,9 @@ def main():
             self.driver_env = None
             self.logq = queue.Queue()
             self.paramq = queue.Queue()
+            self.deployq = queue.Queue()
+            self.remote_sampleq = queue.Queue()
+            self._sample_pending = None
             self._photo = None
             self._last_save = 0.0
             self._last_corners = None
@@ -831,8 +861,8 @@ def main():
             self._build_bottom(ttk, tk)
 
             self._load_driver_defaults()
-            self.cam = CameraThread(self.topic, self.state, self.lock)
-            self.cam.start()
+            if self.source == "local":
+                self._start_local_camera()
             self.log("就绪。驱动=%s 棋盘格=%dx%d 方格=%.1fmm 话题=%s"
                      % (DRIVERS[self.driver]["label"], size[0], size[1], args.square * 1000, self.topic))
             if not os.path.isfile(self.ace_template):
@@ -885,6 +915,44 @@ def main():
                               relief="solid", font=(UI_FONT, 11, "bold"))
                 lb.grid(row=0, column=i * 2, padx=1)
                 self.step_labels[name] = lb
+
+            inputs = ttk.Frame(f)
+            inputs.grid(row=1, column=0, columnspan=9, sticky="w", pady=(3, 1))
+            ttk.Label(inputs, text="图像来源:").pack(side="left")
+            self.source_var = tk.StringVar(value="SSH 远程" if self.source == "ssh" else "本地")
+            source_cb = ttk.Combobox(inputs, textvariable=self.source_var, state="readonly",
+                                     values=("本地", "SSH 远程"), width=11)
+            source_cb.pack(side="left", padx=4)
+            source_cb.bind("<<ComboboxSelected>>", self.on_source_change)
+            ttk.Label(inputs, text="SSH 主机:").pack(side="left", padx=(8, 0))
+            self.ssh_host_var = tk.StringVar(value=args.ssh_host)
+            self.ssh_host_entry = ttk.Entry(inputs, textvariable=self.ssh_host_var, width=25)
+            self.ssh_host_entry.pack(side="left", padx=4)
+            ttk.Button(inputs, text="SSH 设置", command=self.ssh_settings).pack(side="left", padx=4)
+            ttk.Label(inputs, text="原尺寸预览 · JPEG 75 · 不限帧率；采集无损原图").pack(side="left", padx=6)
+            deployment = ttk.Frame(f)
+            deployment.grid(row=2, column=0, columnspan=9, sticky="w", pady=(1, 2))
+            ttk.Label(deployment, text="远端驱动部署:").pack(side="left")
+            self.deploy_scope = tk.StringVar(value="当前相机")
+            ttk.Combobox(deployment, textvariable=self.deploy_scope, state="readonly",
+                         values=("当前相机", "全部三款"), width=11).pack(side="left", padx=4)
+            self.btn_deploy = ttk.Button(deployment, text="部署 / 更新远端驱动", command=self.deploy_driver)
+            self.btn_deploy.pack(side="left", padx=4)
+            ttk.Label(deployment, text="传源码和 SDK，在小电脑编译；保留远端旧版本").pack(side="left", padx=6)
+
+            profiles = ttk.Frame(f)
+            profiles.grid(row=3, column=0, columnspan=9, sticky="w", pady=(1, 2))
+            ttk.Label(profiles, text="本地 SSH 配置:").pack(side="left")
+            self.ssh_profile_var = tk.StringVar()
+            self.ssh_profile_cb = ttk.Combobox(profiles, textvariable=self.ssh_profile_var,
+                                               state="readonly", width=39)
+            self.ssh_profile_cb.pack(side="left", padx=4)
+            self.ssh_profile_cb.bind("<<ComboboxSelected>>", self.load_saved_ssh_profile)
+            ttk.Button(profiles, text="保存当前配置", command=self.save_ssh_profile).pack(side="left", padx=4)
+            ttk.Button(profiles, text="导入配置", command=self.import_ssh_profile).pack(side="left", padx=4)
+            ttk.Checkbutton(profiles, text="记住密码（本机明文）",
+                            variable=self.remember_ssh_password).pack(side="left", padx=4)
+            self._refresh_ssh_profiles()
 
             g = ttk.Frame(self.root, padding=(6, 0))
             g.grid(row=1, column=0, sticky="ew")
@@ -1064,6 +1132,271 @@ def main():
             if args.demo or os.environ.get("CALIB_GUI_DEBUG"):
                 print(line, flush=True)
 
+        def _clear_input_frame(self):
+            with self.lock:
+                self.state["generation"] += 1
+                self.state.update(bgr=None, gray=None, corners=None, disp_rgb=None,
+                                  ncorner=0, stamp=0.0, native=None, decode_err=None)
+            self._native_size = None
+            self._last_stamp = None
+            self._rate = []
+            self._last_corner_ts = 0.0
+            self._pub_warn = None
+            self._remote_open_error = None
+            self._sample_pending = None
+            if self._img_item is not None:
+                self.img_canvas.delete(self._img_item)
+                self._img_item = None
+                self._photo = None
+
+        def _start_local_camera(self):
+            try:
+                import rclpy
+                if not rclpy.ok():
+                    rclpy.init()
+                self.cam = CameraThread(self.topic, self.state, self.lock)
+                self.cam.start()
+            except Exception as e:
+                self.cam = None
+                self.log("本地图像订阅不可用：%s；可选择 SSH 远程来源" % e)
+
+        def on_source_change(self, _evt=None):
+            target = "ssh" if self.source_var.get() == "SSH 远程" else "local"
+            if self._busy():
+                self.source_var.set("SSH 远程" if self.source == "ssh" else "本地")
+                self.log("计算或保存中，请完成后再切换图像来源")
+                return
+            if target == self.source:
+                return
+            self.stop_driver()
+            if self.cam:
+                self.cam.stop()
+                if self.cam.is_alive():
+                    self.cam.join(timeout=1.5)
+                self.cam = None
+            self.source = target
+            self.apply_size()
+            self._clear_input_frame()
+            self.driver_identity = None
+            self.driver_env = None
+            if self.source == "local":
+                self._start_local_camera()
+            self.log("图像来源已切换为%s；沿用上方相机列表，SSH 模式填写主机后点启动驱动" % self.source_var.get())
+
+        def _refresh_ssh_profiles(self, selected=None):
+            paths = ssh_profiles.list_profiles()
+            self._ssh_profile_paths = {path.name: path for path in paths}
+            self.ssh_profile_cb.configure(values=tuple(self._ssh_profile_paths))
+            if selected is not None:
+                self.ssh_profile_var.set(selected.name)
+
+        def save_ssh_profile(self):
+            try:
+                path = ssh_profiles.save_profile(dict(
+                    host=self.ssh_host_var.get().strip(), port=self.ssh_port,
+                    identity_file=self.ssh_key, remote_dir=self.remote_dir,
+                    camera_root=self.remote_camera_root, driver=self.driver,
+                    topic=self.topic_var.get().strip() or TOPIC, password=self.ssh_password),
+                    remember_password=self.remember_ssh_password.get())
+                self._refresh_ssh_profiles(path)
+                self.log("SSH 配置已保存：%s%s" % (path, "（已记住密码）" if self.remember_ssh_password.get() else "（不含密码）"))
+            except (ValueError, OSError) as exc:
+                from tkinter import messagebox
+                messagebox.showerror("无法保存 SSH 配置", str(exc), parent=self.root)
+
+        def _apply_ssh_profile(self, profile):
+            if self._busy():
+                self.log("任务进行中，请完成后再加载 SSH 配置")
+                return False
+            self.stop_driver()
+            if self.cam:
+                self.cam.stop()
+                if self.cam.is_alive():
+                    self.cam.join(timeout=1.5)
+            self.cam = None
+            self.source = "ssh"
+            self.source_var.set("SSH 远程")
+            self.ssh_host_var.set(profile["host"])
+            self.ssh_port = profile["port"]
+            self.ssh_key = profile["identity_file"]
+            self.ssh_password = profile.get("password", "")
+            self.remember_ssh_password.set(bool(self.ssh_password))
+            self.remote_dir = profile["remote_dir"]
+            self.remote_camera_root = profile["camera_root"]
+            self.driver = profile["driver"]
+            self.drv_var.set(DRIVERS[self.driver]["label"])
+            self.topic = profile["topic"]
+            self.topic_var.set(self.topic)
+            self.driver_env = self.driver_identity = None
+            self.apply_size()
+            self._clear_input_frame()
+            self.root.title("相机标定工具 - %s" % DRIVERS[self.driver]["label"])
+            self.log("已加载 SSH 配置：%s:%s；点【启动驱动】连接" % (profile["host"], profile["port"]))
+            return True
+
+        def _load_ssh_profile_path(self, path):
+            try:
+                self._apply_ssh_profile(ssh_profiles.load_profile(path))
+            except (ValueError, OSError) as exc:
+                from tkinter import messagebox
+                messagebox.showerror("无法导入 SSH 配置", str(exc), parent=self.root)
+
+        def load_saved_ssh_profile(self, _event=None):
+            path = self._ssh_profile_paths.get(self.ssh_profile_var.get())
+            if path is not None:
+                self._load_ssh_profile_path(path)
+
+        def import_ssh_profile(self):
+            if self._busy():
+                self.log("任务进行中，请完成后再导入 SSH 配置")
+                return
+            from tkinter import filedialog
+            path = filedialog.askopenfilename(title="导入 SSH 配置", initialdir=str(ssh_profiles.DEFAULT_DIR),
+                                             filetypes=[("SSH 配置 JSON", "*.json")])
+            if path:
+                self._load_ssh_profile_path(path)
+
+        def ssh_settings(self):
+            if self._busy():
+                self.log("任务进行中，请完成后再修改 SSH 设置")
+                return
+            dialog = tk.Toplevel(self.root)
+            dialog.title("SSH 远程相机设置")
+            fields = {}
+            for row, (key, label, value) in enumerate((
+                    ("port", "SSH 端口", self.ssh_port),
+                    ("key", "私钥路径（本机，可留空）", self.ssh_key),
+                    ("password", "SSH 密码（可留空，仅本次会话）", self.ssh_password),
+                    ("dir", "项目目录（小电脑）", self.remote_dir),
+                    ("root", "驱动根目录（小电脑，可留空）", self.remote_camera_root))):
+                ttk.Label(dialog, text=label).grid(row=row, column=0, padx=8, pady=5, sticky="w")
+                fields[key] = tk.StringVar(value=str(value))
+                ttk.Entry(dialog, textvariable=fields[key], width=40,
+                          show="*" if key == "password" else "").grid(row=row, column=1, padx=8, pady=5)
+            ttk.Label(dialog, text="支持密钥、ssh-agent 或密码（需本机 sshpass）。\n点保存后，再用主界面的保存当前配置保存到本地；密码由记住密码选项控制。") \
+                .grid(row=5, column=0, columnspan=2, padx=8, pady=6, sticky="w")
+            def save():
+                try:
+                    port = int(fields["port"].get())
+                    if not 1 <= port <= 65535 or not fields["dir"].get().strip():
+                        raise ValueError()
+                except ValueError:
+                    from tkinter import messagebox
+                    messagebox.showerror("设置有误", "端口须为 1～65535，项目目录不能为空。", parent=dialog)
+                    return
+                self.ssh_port, self.ssh_key = port, fields["key"].get().strip()
+                self.ssh_password = fields["password"].get()
+                self.remote_dir = fields["dir"].get().strip()
+                self.remote_camera_root = fields["root"].get().strip()
+                dialog.destroy()
+            ttk.Button(dialog, text="保存", command=save).grid(row=6, column=1, padx=8, pady=8, sticky="e")
+
+        def deploy_driver(self):
+            if self._busy():
+                self.log("已有任务进行中，请完成后再部署")
+                return
+            if self.source != "ssh":
+                self.log("请先选择 SSH 远程来源并填写主机")
+                return
+            host = self.ssh_host_var.get().strip()
+            if not host:
+                self.log("请填写 SSH 主机，例如 robot@192.168.1.10")
+                return
+            from remote_deploy import deploy_remote
+            selected = "all" if self.deploy_scope.get() == "全部三款" else self.driver
+            port, key = self.ssh_port, self.ssh_key
+            base = self.remote_dir
+            password = self.ssh_password
+            local_root = os.path.dirname(DRIVERS[self.driver]["ws"])
+            self.stop_driver()
+            self._deploy_busy = True
+            self.log("开始部署%s到 %s；源码和 SDK 在远端独立目录构建，旧版本保留" %
+                     ("全部三款相机驱动" if selected == "all" else DRIVERS[selected]["label"], host))
+            def work():
+                try:
+                    path = deploy_remote(host=host, port=port, identity_file=key,
+                        remote_dir=base, driver=selected, local_camera_root=local_root, log=self.log,
+                        password=password)
+                    self.deployq.put((True, path, host, port, key))
+                except Exception as e:
+                    self.deployq.put((False, str(e), host, port, key))
+            threading.Thread(target=work, name="remote-driver-deploy", daemon=True).start()
+
+        def _poll_deployment(self):
+            try:
+                ok, value, host, port, key = self.deployq.get_nowait()
+            except queue.Empty:
+                return
+            self._deploy_busy = False
+            if ok:
+                self.ssh_host_var.set(host)
+                self.ssh_port, self.ssh_key = port, key
+                self.remote_dir = value
+                self.remote_camera_root = value.rstrip("/") + "/drivers"
+                self.apply_size()
+                self._clear_input_frame()
+                self.log("远端部署成功，已选用新版本：%s；点启动驱动查看画面" % value)
+            else:
+                self.log("远端部署失败，保留原连接设置和旧驱动：%s" % value)
+            if getattr(self, "_exit_pending", False):
+                self.quit()
+
+        def _start_remote_camera(self):
+            from remote_camera import RemoteConnection
+            host = self.ssh_host_var.get().strip()
+            try:
+                connection = RemoteConnection(host=host, port=self.ssh_port,
+                    identity_file=self.ssh_key, remote_dir=self.remote_dir,
+                    driver=self.driver, topic=self.topic_var.get().strip() or TOPIC,
+                    camera_root=self.remote_camera_root, fps=0,
+                    password=self.ssh_password)
+            except Exception as e:
+                self.log("SSH 设置有误：%s" % e)
+                return
+            self.topic = self.topic_var.get().strip() or TOPIC
+            self.apply_size()
+            self._clear_input_frame()
+            self.driver_identity = None
+            self.remote = connection
+            # 复用本地的预览检测和原图采样，传输层只替换图像来源。
+            processor = CameraThread(self.topic, self.state, self.lock)
+            # 网络预览固定缩小检测；采样时才在无损原图上完整检测。
+            processor.full_preview_fallback = False
+            processor.preview_interval = 0.0
+            self.cam = processor
+            def identity(value):
+                if self.remote is connection:
+                    self.driver_identity = value
+            def image(msg):
+                if self.remote is connection:
+                    processor.on_image(msg)
+            def remote_log(line):
+                if self.remote is connection and "相机被占用：" in str(line):
+                    self._remote_open_error = str(line)
+                elif (self.remote is connection and "OpenDevice failed" in str(line)
+                      and "相机被占用：" not in (getattr(self, "_remote_open_error", None) or "")):
+                    self._remote_open_error = ("远端相机打开失败：请先停止占用相机的 ACE 或其他程序，"
+                                               "并检查设备权限，然后重试启动驱动。")
+                    self.log(self._remote_open_error)
+                self.log(line)
+            def work():
+                try:
+                    connection.run(image, identity, remote_log)
+                except Exception as e:
+                    if self.remote is connection:
+                        self.log("SSH 连接失败或中断：%s" % e)
+                finally:
+                    if self.remote is connection:
+                        with self.lock:
+                            self.state["generation"] += 1
+                            self.state.update(bgr=None, gray=None, corners=None,
+                                              disp_rgb=None, ncorner=0, stamp=0.0)
+                        self.log("SSH 取流已结束；可点击启动驱动重新连接")
+            self.remote_thread = threading.Thread(target=work, daemon=True)
+            self.remote_thread.start()
+            self.log("SSH 连接 %s，远端相机=%s，JPEG 75 原尺寸预览，不预设帧率上限；采样使用无损原图" %
+                     (host, DRIVERS[self.driver]["label"]))
+
         def on_driver_change(self, _evt=None):
             if self._busy():
                 self.drv_var.set(DRIVERS[self.driver]["label"])
@@ -1152,7 +1485,10 @@ def main():
             if topic != self.topic:
                 self.apply_size()
             self.topic = topic
-            self.cam.set_topic(self.topic)
+            if self.remote is not None:
+                self.remote.set_topic(self.topic)
+            elif self.cam:
+                self.cam.set_topic(self.topic)
             with self.lock:
                 self.state["bgr"] = None
                 self.state["corners"] = None
@@ -1189,6 +1525,14 @@ def main():
             return self.driver_env
 
         def start_driver(self):
+            if self._busy():
+                self.log("计算或保存中，请完成后再启动相机")
+                return
+            if self.source == "ssh":
+                if not self._driver_running():
+                    self.stop_driver()
+                    self._start_remote_camera()
+                return
             if self.driver_proc and self.driver_proc.poll() is None:
                 self.log("驱动已在运行")
                 return
@@ -1246,6 +1590,17 @@ def main():
             self.log("驱动已退出")
 
         def stop_driver(self):
+            if self.remote is not None:
+                connection = self.remote
+                self.remote = None
+                if self.cam:
+                    self.cam.stop()
+                connection.stop()
+                if self.remote_thread:
+                    self.remote_thread.join(timeout=1.5)
+                self.remote_thread = None
+                self._clear_input_frame()
+                self.log("已停止 SSH 远程相机")
             if self.driver_proc and self.driver_proc.poll() is None:
                 try:
                     os.killpg(os.getpgid(self.driver_proc.pid), 15)
@@ -1256,6 +1611,16 @@ def main():
             self.btn_stop.configure(state="disabled")
 
         def apply_exp_gain(self, key, initial=False):
+            if self.source == "ssh":
+                if self.remote is None or not self._driver_running():
+                    if not initial:
+                        self.log("SSH 相机未连接，参数未下发")
+                    return
+                d = DRIVERS[self.driver]
+                value = self.vars[key].get()
+                value = int(round(value)) if key == "exp" or self.driver == "mv" else round(value, 1)
+                self.remote.set_param(d["node"], d[key], value)
+                return
             if not (self.driver_proc and self.driver_proc.poll() is None):
                 if not initial:
                     self.log("驱动没在运行，曝光/增益未下发（可先点“启动驱动”）")
@@ -1325,7 +1690,74 @@ def main():
             self.btns["collect"].configure(text="暂停采集" if self.auto_collect.get() else "开始采集")
             self.log("自动采集: %s" % ("开" if self.auto_collect.get() else "关"))
 
+        def _request_remote_sample(self):
+            if self._busy() or self.remote is None or not self._driver_running():
+                return
+            if self._sample_pending is not None or len(self.samples) >= self.max_samples:
+                return
+            connection = self.remote
+            with self.lock:
+                generation, board = self.state["generation"], self.state["size"]
+            token = object()
+            self._sample_pending = token
+            self._last_save = time.time()
+            def received(msg, error=None):
+                def detect():
+                    try:
+                        if error:
+                            raise RuntimeError(error)
+                        if msg is None or msg.encoding != "mono8":
+                            raise ValueError("远端标定样本须为无损灰度原图")
+                        gray = np.frombuffer(msg.data, np.uint8).reshape(msg.height, msg.width).copy()
+                        # Re-detect on the actual lossless capture, never reuse JPEG corners.
+                        corners = detect_preview(gray, board)
+                        self.remote_sampleq.put((token, connection, generation, gray, corners, None))
+                    except Exception as exc:
+                        self.remote_sampleq.put((token, connection, generation, None, None, str(exc)))
+                threading.Thread(target=detect, name="remote-sample-detect", daemon=True).start()
+            try:
+                connection.request_sample(received)
+            except Exception as exc:
+                self._sample_pending = None
+                self.log("请求无损原图失败：%s" % exc)
+
+        def _poll_remote_sample(self):
+            try:
+                token, connection, generation, gray, corners, error = self.remote_sampleq.get_nowait()
+            except queue.Empty:
+                return
+            if self._sample_pending is not token:
+                return
+            self._sample_pending = None
+            with self.lock:
+                current_generation = self.state["generation"]
+            if connection is not self.remote or generation != current_generation or self._busy():
+                return
+            if error:
+                self.log("采集无损原图失败：%s" % error)
+                return
+            if corners is None:
+                self.log("收到无损原图，但未检测到标定板，没有采集")
+                return
+            if len(self.samples) >= self.max_samples:
+                return
+            if self.auto_collect.get() and self._last_corners is not None and len(self._last_corners) == len(corners):
+                shift = np.linalg.norm(corners.reshape(-1, 2) - self._last_corners.reshape(-1, 2), axis=1).mean()
+                if shift < self.min_shift:
+                    return
+            self._remember_camera_identity()
+            sample = Sample(gray, corners)
+            self.samples.append(sample)
+            self.sample_bytes += sample.arr.nbytes
+            self._record_cover(corners, gray.shape)
+            self._last_corners = corners
+            self._last_save = time.time()
+            self.log("已采集第 %d 张（SSH 无损原图，%d 角点）" % (len(self.samples), len(corners)))
+
         def grab_one(self):
+            if self.source == "ssh":
+                self._request_remote_sample()
+                return
             with self.lock:
                 corners, gray = self.state["corners"], self.state["gray"]
             if corners is None or gray is None:
@@ -1350,7 +1782,7 @@ def main():
             if not self.auto_collect.get() or corners is None or gray is None:
                 return
             now = time.time()
-            if now - self._last_save < 0.4:
+            if now - self._last_save < (1.0 if self.source == "ssh" else 0.4):
                 if os.environ.get("CALIB_GUI_DEBUG"):
                     self._ac_interval = getattr(self, "_ac_interval", 0) + 1
                 return
@@ -1370,6 +1802,9 @@ def main():
                         self._ac_shift = getattr(self, "_ac_shift", 0) + 1
                         self._ac_last_shift = shift
                     return
+            if self.source == "ssh":
+                self._request_remote_sample()
+                return
             s_new = Sample(gray, corners)
             self.samples.append(s_new)
             self.sample_bytes += s_new.arr.nbytes
@@ -1382,7 +1817,9 @@ def main():
         def _remember_camera_identity(self):
             if self.camera_identity is not None:
                 return
-            identity = self.driver_identity or read_camera_identity(self.driver)
+            identity = self.driver_identity or (
+                dict(status="unavailable", devices=[]) if self.source == "ssh"
+                else read_camera_identity(self.driver))
             with self.lock:
                 identity["image_encoding"] = self.state.get("image_encoding", "")
             self.camera_identity = identity
@@ -1516,7 +1953,8 @@ def main():
             tk.Button(win, text="关闭", command=win.destroy).grid(row=1, column=0, pady=6)
 
         def _busy(self):
-            return getattr(self, "_calib_busy", False) or getattr(self, "_save_busy", False)
+            return (getattr(self, "_calib_busy", False) or getattr(self, "_save_busy", False)
+                    or getattr(self, "_deploy_busy", False))
 
         def do_save(self):
             if self._busy():
@@ -1623,6 +2061,9 @@ def main():
                      % (path, os.path.basename(self.ace_template)))
 
         def do_write_driver(self):
+            if self.source == "ssh":
+                self.log("SSH 模式结果保存在本机；请将导出的 YAML 部署到小电脑对应驱动，当前不自动覆盖远端配置")
+                return
             if self._busy():
                 self.log("计算或保存尚未完成，请稍候")
                 return
@@ -1686,6 +2127,8 @@ def main():
 
         # ---------------- 引导 / 按钮可用性 ----------------
         def _driver_running(self):
+            if self.source == "ssh":
+                return self.remote is not None and self.remote_thread is not None and self.remote_thread.is_alive()
             return bool(self.driver_proc and self.driver_proc.poll() is None)
 
         def _current_step(self):
@@ -1707,6 +2150,8 @@ def main():
         def _check_publishers(self):
             """话题上有多个发布者时（比如另开了别的相机节点），图像会交替来自不同相机，
             标定结果直接作废。这里定时检查并给出显眼警告。"""
+            if self.source == "ssh":
+                return
             now = time.time()
             if now - getattr(self, "_pub_t", 0) < 5.0:
                 return
@@ -1758,14 +2203,15 @@ def main():
             def set_state(key, ok):
                 self.btns[key].configure(state="normal" if ok else "disabled")
 
-            self.btn_start.configure(state="disabled" if running else "normal")
+            self.btn_start.configure(state="disabled" if running or busy else "normal")
             self.btn_stop.configure(state="normal" if running else "disabled")
             set_state("collect", has_frame and not busy)
-            set_state("grab", has_frame and ncorner > 0 and not busy)
+            set_state("grab", has_frame and (ncorner > 0 or self.source == "ssh") and not busy)
             set_state("calib", len(self.samples) >= MIN_SAMPLES and not busy)
             for key in ("check", "save", "ace", "write"):
-                set_state(key, self.res is not None and not busy)
+                set_state(key, self.res is not None and not busy and (key != "write" or self.source == "local"))
             set_state("apply", not busy)
+            self.btn_deploy.configure(state="normal" if self.source == "ssh" and not busy else "disabled")
 
             n = len(self.samples)
             prog = coverage_progress(self.sample_params)
@@ -1777,14 +2223,17 @@ def main():
                     "位置" if worst[0] in ("x", "y") else ("距离远近" if worst[0] == "size" else "倾斜角度"))
             if getattr(self, "_pub_warn", None):
                 hint = "⚠ " + self._pub_warn
+            elif self.source == "ssh" and getattr(self, "_remote_open_error", None):
+                hint = self._remote_open_error
             elif decode_err:
                 hint = "图像的像素格式不支持（%s）→ 把驱动改成 rgb8 或 mono8 后重试" % decode_err
+            elif getattr(self, "_deploy_busy", False):
+                hint = "正在上传并编译远端驱动，进度见日志；原驱动保留，成功后切换新目录"
             elif busy:
                 hint = ("正在保存结果，请稍候 ..." if getattr(self, "_save_busy", False)
                         else "标定计算中，请稍候 ...（窗口可以继续动，算完会自动出结果）")
             elif step == 0:
-                hint = ("第 1 步：点【启动驱动】启动相机（相机插好、USB3 口直连）。"
-                        "相机已在别处启动的话，等画面出现即可。")
+                hint = source_start_hint(self.source, self.topic)
             elif not det_ok:
                 hint = ("画面里没检测到标定板 → 确认板子完整在画面内、光线均匀；"
                         "若尺寸不对（12x9 个方格应为 11x8），改滑条/输入框后点【应用尺寸并重新开始】。")
@@ -1812,7 +2261,8 @@ def main():
                 hint = "完成 ✔ 重新标定：改尺寸滑条/输入框 →【应用尺寸并重新开始】→ 回到第 2 步"
             try:
                 self.hint_label.configure(
-                    foreground="#c00000" if getattr(self, "_pub_warn", None) else "#0645ad")
+                    foreground="#c00000" if (getattr(self, "_pub_warn", None) or
+                                                getattr(self, "_remote_open_error", None)) else "#0645ad")
             except Exception:
                 pass
             if hint != self._last_hint:
@@ -1850,6 +2300,8 @@ def main():
                 self._update_image()
                 self._poll_calibration()
                 self._poll_save()
+                self._poll_deployment()
+                self._poll_remote_sample()
                 if getattr(self, "_quitting", False):
                     return
                 self._check_publishers()
@@ -1857,7 +2309,7 @@ def main():
                 self._refresh()
             except Exception as e:
                 self.log("界面异常: %s" % e)
-            self.root.after(80, self.tick)
+            self.root.after(15 if self.source == "ssh" else 80, self.tick)
 
         def _ac_stats(self, now):
             t = getattr(self, "_ac_t", 0.0)
@@ -1875,7 +2327,8 @@ def main():
                         getattr(self, "_ac_interval", 0), getattr(self, "_ac_shift", 0),
                         getattr(self, "_ac_last_shift", -1), len(self.samples)))
             self._ac_calls = self._ac_interval = self._ac_shift = 0
-            self.cam._img_in = self.cam._img_ok = self.cam._img_det = 0
+            if self.cam is not None:
+                self.cam._img_in = self.cam._img_ok = self.cam._img_det = 0
 
         def _diag_once(self):
             if not os.environ.get("CALIB_GUI_DEBUG") or getattr(self, "_diag_done", False):
@@ -1961,12 +2414,25 @@ def main():
                 ncorner = self.state["ncorner"]
                 stamp = self.state["stamp"]
                 gray = self.state["gray"]
+                if self.source == "ssh" and stamp and time.time() - stamp > 3.0:
+                    # 断流后不能继续采集最后一张旧画面。
+                    self.state.update(bgr=None, gray=None, corners=None, disp_rgb=None, ncorner=0)
+                    rgb = corners = gray = None
+                    ncorner = 0
             if rgb is None:
+                if self.source == "ssh" and self._img_item is not None:
+                    self.img_canvas.delete(self._img_item)
+                    self._img_item = None
+                    self._photo = None
                 err = self.state.get("decode_err")
-                if err:
+                if self.source == "ssh" and getattr(self, "_remote_open_error", None):
+                    self.status.set(self._remote_open_error)
+                elif err:
                     self.status.set("收到图像但解码失败：%s" % err)
+                elif self.source == "ssh":
+                    self.status.set("等待远端 %s 图像：需先释放相机，再点【启动驱动】" % self.topic)
                 else:
-                    self.status.set("等待 %s 的图像 ...（先点“启动驱动”，或确认相机已插好）" % self.topic)
+                    self.status.set("等待本地 ROS 话题 %s 的图像，请启动驱动或检查发布者" % self.topic)
                 return
             now = time.time()
             self._rate = [t for t in self._rate if now - t < 2.0]
@@ -2015,6 +2481,11 @@ def main():
             self.do_calibrate()
 
         def quit(self):
+            if getattr(self, "_deploy_busy", False):
+                if not getattr(self, "_exit_pending", False):
+                    self.log("正在部署远端驱动，完成或失败后将自动退出")
+                self._exit_pending = True
+                return
             if getattr(self, "_save_busy", False):
                 if not getattr(self, "_exit_pending", False):
                     self.log("正在保存，完成后将自动退出")
@@ -2026,7 +2497,8 @@ def main():
             self.stop_driver()
             try:
                 self.cam.stop()
-                self.cam.join(timeout=1.5)      # 等采集线程干净退出，避免退出时崩溃
+                if self.cam.is_alive():
+                    self.cam.join(timeout=1.5)  # 等采集线程干净退出，避免退出时崩溃
             except Exception:
                 pass
             try:
@@ -2039,8 +2511,6 @@ def main():
             except Exception:
                 pass
 
-    import rclpy
-    rclpy.init()
     root = tk.Tk()
     try:
         ttk.Style().theme_use("clam")   # 默认主题下滑条轨道几乎看不见
@@ -2079,7 +2549,9 @@ def main():
         app.quit()
     finally:
         try:
-            rclpy.shutdown()
+            import rclpy
+            if rclpy.ok():
+                rclpy.shutdown()
         except Exception:
             pass
     if args.demo and not app.saved:
